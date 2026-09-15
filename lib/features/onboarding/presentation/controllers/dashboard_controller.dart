@@ -1,137 +1,84 @@
 import 'package:get/get.dart';
-
-// ── Models ────────────────────────────────────────────────────────────────────
-class SupervisorMetrics {
-  final int supervisorEmployeeId;
-  final int onboarded;
-  final int approved;
-  final int rejected;
-  final double approvalRate;
-  final int managedWorkforce;
-  final List<String> clientNames;
-  final List<String> branchNames;
-
-  SupervisorMetrics({
-    required this.supervisorEmployeeId,
-    required this.onboarded,
-    required this.approved,
-    required this.rejected,
-    required this.approvalRate,
-    required this.managedWorkforce,
-    this.clientNames = const [],
-    this.branchNames = const [],
-  });
-
-  int get pending => (onboarded - approved - rejected).clamp(0, onboarded);
-}
-
-class WorkforceStats {
-  final int working;
-  final int deployed;
-  final int bench;
-  final double benchRatio;
-
-  WorkforceStats({
-    required this.working,
-    required this.deployed,
-    required this.bench,
-    required this.benchRatio,
-  });
-}
-
-class RecentOnboardingRow {
-  final int employeeId;
-  final String fullName;
-  final String status;
-  final String? employmentType;
-  final String? joiningDate;
-  final String? branch;
-  final String? client;
-
-  RecentOnboardingRow({
-    required this.employeeId,
-    required this.fullName,
-    required this.status,
-    this.employmentType,
-    this.joiningDate,
-    this.branch,
-    this.client,
-  });
-}
+import 'package:dio/dio.dart';
+import '../../../../core/network/api_client.dart';
+import '../../domain/employee_models.dart';
+import '../../data/employee_api.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// CONTROLLER — pure mock, zero API calls
+// CONTROLLER — real API calls to GET /api/v1/dashboard/summary +
+//              GET /api/v1/employees/my-submissions +
+//              GET /api/v1/employees/onboarding/pending
 // ═══════════════════════════════════════════════════════════════════════════════
 class DashboardController extends GetxController {
-  final loading           = false.obs;
-  final error             = ''.obs;
+  final loading = false.obs;
+  final error = ''.obs;
   final supervisorMetrics = Rxn<SupervisorMetrics>();
-  final workforceStats    = Rxn<WorkforceStats>();
-  final recentOnboarding  = <RecentOnboardingRow>[].obs;
-  final pendingApprovals  = <dynamic>[].obs;
+  final workforceStats = Rxn<WorkforceStats>();
+  final recentOnboarding = <RecentOnboardingRow>[].obs;
+  final pendingApprovals = <dynamic>[].obs;
+
+  final _api = EmployeeApi();
 
   @override
   void onInit() {
     super.onInit();
-    _loadMockData();
+    load();
   }
 
-  void _loadMockData() {
-    supervisorMetrics.value = SupervisorMetrics(
-      supervisorEmployeeId: 1,
-      onboarded:        47,
-      approved:         38,
-      rejected:          4,
-      approvalRate:      0.809,
-      managedWorkforce: 83,
-      clientNames: ['Acme Corp', 'Globex'],
-      branchNames: ['Mumbai HQ', 'Pune Branch'],
-    );
-
-    workforceStats.value = WorkforceStats(
-      working:    83,
-      deployed:   71,
-      bench:      12,
-      benchRatio: 0.145,
-    );
-
-    recentOnboarding.value = [
-      RecentOnboardingRow(
-        employeeId: 101, fullName: 'Priya Sharma',
-        status: 'PENDING_APPROVAL', employmentType: 'CONTRACT',
-        joiningDate: '2026-09-01', branch: 'Mumbai HQ', client: 'Acme Corp',
-      ),
-      RecentOnboardingRow(
-        employeeId: 102, fullName: 'Rahul Verma',
-        status: 'ACTIVE', employmentType: 'FULL_TIME',
-        joiningDate: '2026-08-15', branch: 'Pune Branch', client: 'Globex',
-      ),
-      RecentOnboardingRow(
-        employeeId: 103, fullName: 'Anita Joshi',
-        status: 'PENDING_APPROVAL', employmentType: 'NAPS',
-        joiningDate: '2026-09-05', branch: 'Mumbai HQ', client: 'Acme Corp',
-      ),
-      RecentOnboardingRow(
-        employeeId: 104, fullName: 'Deepak Kumar',
-        status: 'ACTIVE', employmentType: 'CONTRACT',
-        joiningDate: '2026-08-20', branch: 'Pune Branch', client: 'Globex',
-      ),
-      RecentOnboardingRow(
-        employeeId: 105, fullName: 'Sneha Patil',
-        status: 'ACTIVE', employmentType: 'INTERN',
-        joiningDate: '2026-08-10', branch: 'Nashik Office', client: 'Acme Corp',
-      ),
-    ];
-
-    // 3 pending approvals for the pending tile count
-    pendingApprovals.value = [1, 2, 3];
-  }
-
-  // Called by retry button — just reload mock
+  /// Fetch all dashboard data from real APIs.
   Future<void> load() async {
     loading.value = true;
-    await Future.delayed(const Duration(milliseconds: 500));
-    _loadMockData();
-    loading.value = false;
+    error.value = '';
+
+    try {
+      // 1) Dashboard summary — GET /api/v1/dashboard/summary (→ core :8081)
+      //    Response shape: ApiResponse { data: DashboardSummaryResponse }
+      //    The DashboardSummaryResponse contains:
+      //      supervisorMetrics, workforceStats, and more — all optional blocks.
+      final summaryData = await _api.getDashboardSummary();
+      final payload = summaryData['data'] ?? summaryData;
+
+      // Parse supervisor metrics block (if present)
+      if (payload['supervisorMetrics'] != null) {
+        supervisorMetrics.value = SupervisorMetrics.fromJson(
+          payload['supervisorMetrics'] as Map<String, dynamic>,
+        );
+      }
+
+      // Parse workforce stats block (if present)
+      if (payload['workforceStats'] != null) {
+        workforceStats.value = WorkforceStats.fromJson(
+          payload['workforceStats'] as Map<String, dynamic>,
+        );
+      }
+
+      // 2) Recent onboarding (my submissions) — GET /api/v1/employees/my-submissions
+      try {
+        final submissions = await _api.getMySubmissions();
+        recentOnboarding.value = submissions
+            .map((e) => RecentOnboardingRow.fromJson(e as Map<String, dynamic>))
+            .toList();
+      } catch (_) {
+        // Non-critical — dashboard still shows other data
+        recentOnboarding.clear();
+      }
+
+      // 3) Pending approvals count — GET /api/v1/employees/onboarding/pending
+      try {
+        final pending = await _api.getPendingOnboarding();
+        pendingApprovals.value = pending;
+      } catch (_) {
+        pendingApprovals.clear();
+      }
+    } on DioException catch (e) {
+      final msg = e.response?.data is Map
+          ? (e.response!.data as Map)['message'] ?? e.message
+          : e.message ?? 'Failed to load dashboard';
+      error.value = msg.toString();
+    } catch (e) {
+      error.value = 'Failed to load dashboard: $e';
+    } finally {
+      loading.value = false;
+    }
   }
 }
