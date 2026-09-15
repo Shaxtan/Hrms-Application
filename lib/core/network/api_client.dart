@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:logger/logger.dart';
@@ -175,6 +176,46 @@ class ApiClient {
   }
 
   static Dio get instance => _dio;
+
+  /// Decode a JWT payload (the middle Base64 segment) without verification.
+  /// Returns the claims map, or empty map on failure.
+  static Map<String, dynamic> decodeJwtPayload(String token) {
+    try {
+      final parts = token.split('.');
+      if (parts.length != 3) return {};
+      // Base64 segment needs padding
+      String payload = parts[1];
+      switch (payload.length % 4) {
+        case 2:
+          payload += '==';
+          break;
+        case 3:
+          payload += '=';
+          break;
+      }
+      final decoded = String.fromCharCodes(
+        base64Url.decode(payload),
+      );
+      final map = jsonDecode(decoded);
+      return map is Map<String, dynamic> ? map : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  /// Extract tenantId from JWT claims.
+  static String? getTenantIdFromToken(String? token) {
+    if (token == null) return null;
+    final claims = decodeJwtPayload(token);
+    return claims['tenantId']?.toString();
+  }
+
+  /// Extract branchId from JWT claims.
+  static String? getBranchIdFromToken(String? token) {
+    if (token == null) return null;
+    final claims = decodeJwtPayload(token);
+    return (claims['activeBranchId'] ?? claims['branchId'])?.toString();
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -218,15 +259,17 @@ class _AuthInterceptor extends Interceptor {
     RequestInterceptorHandler handler,
   ) async {
     final token = await _storage.read(key: 'auth_token');
-    final tenantId = await _storage.read(key: 'tenant_id');
-    final branchId = await _storage.read(key: 'branch_id');
+    final storedTenantId = await _storage.read(key: 'tenant_id');
+    final storedBranchId = await _storage.read(key: 'branch_id');
 
     if (token != null && !_isPublic(options.path)) {
       options.headers['Authorization'] = 'Bearer $token';
-    }
 
-    if (token != null && !_isPublic(options.path)) {
+      // Prefer stored tenantId; fall back to decoding the JWT (same as web frontend).
+      final tenantId = storedTenantId ?? ApiClient.getTenantIdFromToken(token);
       options.headers['X-Tenant-ID'] = tenantId ?? '0';
+
+      final branchId = storedBranchId ?? ApiClient.getBranchIdFromToken(token);
       if (branchId != null) {
         options.headers['X-Branch-ID'] = branchId;
       }

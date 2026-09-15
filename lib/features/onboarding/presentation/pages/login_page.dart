@@ -28,6 +28,25 @@ class AuthController extends GetxController {
 
   int? get employeeId => _employeeId;
 
+  /// Extract role from various possible response shapes.
+  static String _extractRole(Map<String, dynamic> user) {
+    // Could be: role (string), roles (list of strings), authorities (list of maps)
+    if (user['role'] is String) return user['role'];
+    if (user['roles'] is List && (user['roles'] as List).isNotEmpty) {
+      final first = (user['roles'] as List).first;
+      if (first is String) return first;
+      if (first is Map) return first['name'] ?? first['authority'] ?? '';
+    }
+    if (user['authorities'] is List &&
+        (user['authorities'] as List).isNotEmpty) {
+      final first = (user['authorities'] as List).first;
+      if (first is String) return first.replaceFirst('ROLE_', '');
+      if (first is Map)
+        return (first['authority'] ?? '').toString().replaceFirst('ROLE_', '');
+    }
+    return '';
+  }
+
   String get roleDisplay {
     switch (userRole.value) {
       case 'PLATFORM_ADMIN':
@@ -90,32 +109,54 @@ class AuthController extends GetxController {
       });
 
       final body = res.data as Map<String, dynamic>;
-      final success = body['success'] ?? false;
 
-      if (!success) {
-        errorMessage.value = body['message'] ?? 'Login failed.';
-        isLoading.value = false;
-        return;
+      // DEBUG: print the full response so we can see the actual shape
+      debugPrint('LOGIN RESPONSE: $body');
+      debugPrint('LOGIN RESPONSE KEYS: ${body.keys.toList()}');
+      if (body['data'] != null)
+        debugPrint('LOGIN DATA KEYS: ${(body['data'] as Map?)?.keys.toList()}');
+      // The response envelope may or may not have a 'data' wrapper.
+      // Try both: body['data'] (wrapped) and body itself (flat).
+      final Map<String, dynamic> data;
+      if (body['data'] is Map<String, dynamic>) {
+        data = body['data'] as Map<String, dynamic>;
+      } else {
+        data = body;
       }
 
-      final data = body['data'] as Map<String, dynamic>? ?? {};
-
-      final token = data['accessToken'] as String?;
-      final user = data['user'] as Map<String, dynamic>? ?? {};
-      final name =
-          '${user['firstName'] ?? ''} ${user['lastName'] ?? ''}'.trim();
-      final role = (user['role'] ?? user['roles']?[0] ?? '') as String;
-      final tenantId = (user['tenantId'] ?? data['tenantId'])?.toString();
-      final branchId = (user['branchId'] ?? data['branchId'])?.toString();
-      final empId = user['employeeId']?.toString();
-      final company =
-          (user['companyName'] ?? user['tenantName'] ?? '') as String;
+      // Token can be at data.accessToken or data.token
+      final token = (data['accessToken'] ?? data['token']) as String?;
 
       if (token == null || token.isEmpty) {
-        errorMessage.value = 'Login succeeded but no token received.';
+        errorMessage.value =
+            body['message'] ?? 'Login failed — no token received.';
         isLoading.value = false;
         return;
       }
+
+      // DEBUG: print JWT claims to see tenantId, branchId, role etc.
+      debugPrint('JWT CLAIMS: ${ApiClient.decodeJwtPayload(token)}');
+
+      // User object can be nested under 'user' or flat in data
+      final Map<String, dynamic> user;
+      if (data['user'] is Map<String, dynamic>) {
+        user = data['user'] as Map<String, dynamic>;
+      } else {
+        user = data;
+      }
+
+      final name =
+          '${user['firstName'] ?? ''} ${user['lastName'] ?? ''}'.trim();
+      final role = _extractRole(user);
+      final tenantId = (user['tenantId'] ?? data['tenantId'])?.toString() ??
+          ApiClient.getTenantIdFromToken(token);
+      final branchId = (user['branchId'] ?? data['branchId'])?.toString() ??
+          ApiClient.getBranchIdFromToken(token);
+      final empId = (user['employeeId'] ?? data['employeeId'])?.toString();
+      final company = (user['companyName'] ??
+          user['tenantName'] ??
+          data['companyName'] ??
+          '') as String;
 
       // Compute initials
       final parts = name.split(' ').where((w) => w.isNotEmpty).toList();
