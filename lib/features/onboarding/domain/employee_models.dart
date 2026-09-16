@@ -33,21 +33,33 @@ class EmployeeSummary {
   String get fullName => '$firstName $lastName'.trim();
   String get displayCode => customCode ?? employeeCode;
 
-  factory EmployeeSummary.fromJson(Map<String, dynamic> j) => EmployeeSummary(
-        id: j['id'] ?? j['employeeId'],
-        employeeCode: j['employeeCode'] ?? '',
-        customCode: j['customCode'],
-        firstName: j['firstName'] ?? '',
-        lastName: j['lastName'] ?? '',
-        email: j['email'],
-        phone: j['phone'] ?? j['mobileNumber'],
-        status: j['status'] ?? 'ACTIVE',
-        employmentType: j['employmentType'],
-        profilePhotoUrl: j['profilePhotoUrl'],
-        department: j['department'],
-        branch: j['branch'],
-        designation: j['designation'],
-      );
+  factory EmployeeSummary.fromJson(Map<String, dynamic> j) {
+    // API returns fullName as one field; split into first/last for compatibility
+    String rawFirst = (j['firstName'] ?? '').toString().trim();
+    String rawLast = (j['lastName'] ?? '').toString().trim();
+    if (rawFirst.isEmpty && rawLast.isEmpty) {
+      final full = (j['fullName'] ?? '').toString().trim();
+      final parts =
+          full.split(RegExp(r'\s+')).where((s) => s.isNotEmpty).toList();
+      rawFirst = parts.isNotEmpty ? parts.first : '';
+      rawLast = parts.length > 1 ? parts.sublist(1).join(' ') : '';
+    }
+    return EmployeeSummary(
+      id: j['employeeId'] ?? j['id'] ?? 0,
+      employeeCode: j['employeeCode'] ?? '',
+      customCode: j['customCode'],
+      firstName: rawFirst,
+      lastName: rawLast,
+      email: j['email'],
+      phone: j['phone'] ?? j['mobileNumber'],
+      status: j['status'] ?? 'ACTIVE',
+      employmentType: j['employmentType'],
+      profilePhotoUrl: j['profilePhotoUrl'],
+      department: j['department'],
+      branch: j['branchName'] ?? j['branch'],
+      designation: j['designation'],
+    );
+  }
 }
 
 // ── Pipeline metrics (supervisor dashboard) ───────────────────────────────────
@@ -132,13 +144,14 @@ class RecentOnboardingRow {
 
   factory RecentOnboardingRow.fromJson(Map<String, dynamic> j) =>
       RecentOnboardingRow(
-        employeeId: j['employeeId'] ?? j['id'],
-        fullName: j['fullName'] ?? '${j['firstName']} ${j['lastName']}',
+        employeeId: j['employeeId'] ?? j['id'] ?? 0,
+        fullName: j['fullName'] ??
+            '${j['firstName'] ?? ''} ${j['lastName'] ?? ''}'.trim(),
         status: j['status'] ?? '',
         employmentType: j['employmentType'],
         joiningDate: j['joiningDate'],
-        branch: j['branch'],
-        client: j['client'],
+        branch: j['branchName'] ?? j['branch'],
+        client: j['client'] ?? j['clientCompanyName'],
       );
 }
 

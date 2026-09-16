@@ -9,11 +9,8 @@ class EmployeeController extends GetxController {
   final searchQuery = ''.obs;
   final statusFilter = 'ALL'.obs;
   final typeFilter = 'ALL'.obs;
-
   final isLoading = false.obs;
   final errorMsg = ''.obs;
-  final currentPage = 0.obs;
-  final totalPages = 1.obs;
   final totalRecords = 0.obs;
 
   final _api = EmployeeApi();
@@ -24,36 +21,25 @@ class EmployeeController extends GetxController {
     fetchEmployees();
   }
 
-  /// Fetch employees from POST /api/v1/employees/list
   Future<void> fetchEmployees({int page = 0}) async {
     isLoading.value = true;
     errorMsg.value = '';
-
     try {
-      // Build filter request matching the web's FilterRequest shape
       final filters = <String, dynamic>{};
-      if (statusFilter.value != 'ALL') {
-        filters['status'] = statusFilter.value;
-      }
-      if (typeFilter.value != 'ALL') {
+      if (statusFilter.value != 'ALL') filters['status'] = statusFilter.value;
+      if (typeFilter.value != 'ALL')
         filters['employmentType'] = typeFilter.value;
-      }
-      if (searchQuery.value.isNotEmpty) {
-        filters['search'] = searchQuery.value;
-      }
+      if (searchQuery.value.isNotEmpty) filters['search'] = searchQuery.value;
 
-      final filterRequest = {
+      final res = await _api.getEmployees({
         'page': page,
         'size': 50,
         'sortBy': 'firstName',
         'sortDir': 'ASC',
         'filters': filters,
-      };
+      });
 
-      final res = await _api.getEmployees(filterRequest);
-
-      // Map domain EmployeeSummary → page-level Employee model
-      final list = (res.data ?? [])
+      employees.value = (res.data ?? [])
           .map((s) => Employee(
                 id: s.id,
                 employeeCode: s.employeeCode,
@@ -68,11 +54,7 @@ class EmployeeController extends GetxController {
                 branch: s.branch,
               ))
           .toList();
-
-      employees.value = list;
-      currentPage.value = res.page ?? 0;
-      totalPages.value = res.totalPages ?? 1;
-      totalRecords.value = res.totalRecords ?? list.length;
+      totalRecords.value = res.totalRecords ?? employees.length;
     } on DioException catch (e) {
       errorMsg.value = ApiFailure.fromDioException(e).message;
     } catch (e) {
@@ -82,8 +64,6 @@ class EmployeeController extends GetxController {
     }
   }
 
-  /// Filtered list (client-side quick filter on already-fetched data).
-  /// For server-side filtering, call fetchEmployees() which sends filters.
   List<Employee> get filtered {
     final q = searchQuery.value.toLowerCase();
     return employees.where((e) {
@@ -100,7 +80,6 @@ class EmployeeController extends GetxController {
     }).toList();
   }
 
-  /// Re-fetch with current filters from the API
   void applyFilters() => fetchEmployees();
 
   void updateEmployee(Employee updated) {
