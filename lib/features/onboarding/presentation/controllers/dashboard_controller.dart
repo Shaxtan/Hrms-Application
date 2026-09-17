@@ -4,17 +4,79 @@ import '../../../../core/network/api_client.dart';
 import '../../domain/employee_models.dart';
 import '../../data/employee_api.dart';
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// CONTROLLER — real API calls to GET /api/v1/dashboard/summary +
-//              GET /api/v1/employees/my-submissions +
-//              GET /api/v1/employees/onboarding/pending
-// ═══════════════════════════════════════════════════════════════════════════════
+/// Workforce stats parsed from `data.workforce` in the dashboard summary API.
+class WorkforceSummary {
+  final int totalEmployees, working, deployed, bench;
+  final double benchRatio;
+  final int pendingOnboarding, rejected, deactivated, pendingSalarySetup;
+  final int onProbation, newJoinersThisMonth, exitsThisMonth;
+
+  WorkforceSummary({
+    required this.totalEmployees,
+    required this.working,
+    required this.deployed,
+    required this.bench,
+    required this.benchRatio,
+    required this.pendingOnboarding,
+    required this.rejected,
+    required this.deactivated,
+    required this.pendingSalarySetup,
+    required this.onProbation,
+    required this.newJoinersThisMonth,
+    required this.exitsThisMonth,
+  });
+
+  int get unassigned => bench;
+  double get unassignedPct =>
+      totalEmployees > 0 ? (bench / totalEmployees * 100) : 0;
+
+  factory WorkforceSummary.fromJson(Map<String, dynamic> j) => WorkforceSummary(
+        totalEmployees: j['totalEmployees'] ?? 0,
+        working: j['working'] ?? 0,
+        deployed: j['deployed'] ?? 0,
+        bench: j['bench'] ?? 0,
+        benchRatio: (j['benchRatio'] ?? 0).toDouble(),
+        pendingOnboarding: j['pendingOnboarding'] ?? 0,
+        rejected: j['rejected'] ?? 0,
+        deactivated: j['deactivated'] ?? 0,
+        pendingSalarySetup: j['pendingSalarySetup'] ?? 0,
+        onProbation: j['onProbation'] ?? 0,
+        newJoinersThisMonth: j['newJoinersThisMonth'] ?? 0,
+        exitsThisMonth: j['exitsThisMonth'] ?? 0,
+      );
+}
+
+/// Recent onboarding entry from `data.recentOnboarding`.
+class RecentOnboardingEntry {
+  final int employeeId;
+  final String name, status;
+  final String? createdAt, rejectionReason;
+
+  RecentOnboardingEntry(
+      {required this.employeeId,
+      required this.name,
+      required this.status,
+      this.createdAt,
+      this.rejectionReason});
+
+  factory RecentOnboardingEntry.fromJson(Map<String, dynamic> j) =>
+      RecentOnboardingEntry(
+        employeeId: j['employeeId'] ?? 0,
+        name: j['name'] ?? j['fullName'] ?? '',
+        status: j['status'] ?? '',
+        createdAt: j['createdAt'],
+        rejectionReason: j['rejectionReason'],
+      );
+}
+
 class DashboardController extends GetxController {
   final loading = false.obs;
   final error = ''.obs;
+  final workforce = Rxn<WorkforceSummary>();
+  final recentOnboarding = <RecentOnboardingEntry>[].obs;
+  final pendingCount = 0.obs;
   final supervisorMetrics = Rxn<SupervisorMetrics>();
   final workforceStats = Rxn<WorkforceStats>();
-  final recentOnboarding = <RecentOnboardingRow>[].obs;
   final pendingApprovals = <dynamic>[].obs;
 
   final _api = EmployeeApi();
@@ -25,56 +87,47 @@ class DashboardController extends GetxController {
     load();
   }
 
-  /// Fetch all dashboard data from real APIs.
   Future<void> load() async {
     loading.value = true;
     error.value = '';
-
     try {
-      // 1) Dashboard summary — GET /api/v1/dashboard/summary (→ core :8081)
-      //    Response shape: ApiResponse { data: DashboardSummaryResponse }
-      //    The DashboardSummaryResponse contains:
-      //      supervisorMetrics, workforceStats, and more — all optional blocks.
       final summaryData = await _api.getDashboardSummary();
       final payload = summaryData['data'] ?? summaryData;
-
-      // Parse supervisor metrics block (if present)
-      if (payload['supervisorMetrics'] != null) {
-        supervisorMetrics.value = SupervisorMetrics.fromJson(
-          payload['supervisorMetrics'] as Map<String, dynamic>,
-        );
-      }
-
-      // Parse workforce stats block (if present)
-      if (payload['workforceStats'] != null) {
-        workforceStats.value = WorkforceStats.fromJson(
-          payload['workforceStats'] as Map<String, dynamic>,
-        );
-      }
-
-      // 2) Recent onboarding (my submissions) — GET /api/v1/employees/my-submissions
-      try {
-        final submissions = await _api.getMySubmissions();
-        recentOnboarding.value = submissions
-            .map((e) => RecentOnboardingRow.fromJson(e as Map<String, dynamic>))
-            .toList();
-      } catch (_) {
-        // Non-critical — dashboard still shows other data
-        recentOnboarding.clear();
-      }
-
-      // 3) Pending approvals count — GET /api/v1/employees/onboarding/pending
-      try {
-        final pending = await _api.getPendingOnboarding();
-        pendingApprovals.value = pending;
-      } catch (_) {
-        pendingApprovals.clear();
+      if (payload is Map<String, dynamic>) {
+        // Workforce
+        if (payload['workforce'] != null) {
+          workforce.value = WorkforceSummary.fromJson(payload['workforce']);
+          final w = payload['workforce'];
+          workforceStats.value = WorkforceStats(
+              working: w['working'] ?? 0,
+              deployed: w['deployed'] ?? 0,
+              bench: w['bench'] ?? 0,
+              benchRatio: (w['benchRatio'] ?? 0).toDouble());
+        }
+        // Supervisor metrics (array in real API)
+        if (payload['supervisorMetrics'] is List) {
+          final list = payload['supervisorMetrics'] as List;
+          if (list.isNotEmpty)
+            supervisorMetrics.value = SupervisorMetrics.fromJson(list.first);
+        } else if (payload['supervisorMetrics'] is Map) {
+          supervisorMetrics.value =
+              SupervisorMetrics.fromJson(payload['supervisorMetrics']);
+        }
+        // Pending approvals
+        if (payload['pendingApprovals'] is Map) {
+          final c = (payload['pendingApprovals'] as Map)['count'] ?? 0;
+          pendingCount.value = c;
+          pendingApprovals.value = List.filled(c, 1);
+        }
+        // Recent onboarding
+        if (payload['recentOnboarding'] is List) {
+          recentOnboarding.value = (payload['recentOnboarding'] as List)
+              .map((e) => RecentOnboardingEntry.fromJson(e))
+              .toList();
+        }
       }
     } on DioException catch (e) {
-      final msg = e.response?.data is Map
-          ? (e.response!.data as Map)['message'] ?? e.message
-          : e.message ?? 'Failed to load dashboard';
-      error.value = msg.toString();
+      error.value = ApiFailure.fromDioException(e).message;
     } catch (e) {
       error.value = 'Failed to load dashboard: $e';
     } finally {

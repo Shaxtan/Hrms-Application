@@ -36,7 +36,6 @@ class AttendanceController extends GetxController {
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       currentTime.value = DateTime.now();
     });
-    // Fetch today's status on load
     _fetchTodayStatus();
   }
 
@@ -47,9 +46,6 @@ class AttendanceController extends GetxController {
     super.onClose();
   }
 
-  /// Fetch today's attendance status from the API.
-  /// Uses POST /api/v1/attendance/list with today's date filter
-  /// (same approach as the web frontend's getTodayStatus).
   Future<void> _fetchTodayStatus() async {
     try {
       final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
@@ -60,56 +56,38 @@ class AttendanceController extends GetxController {
         'sortDir': 'DESC',
         'filters': {'dateFrom': today, 'dateTo': today},
       });
-
       final record = (res.data?['data'] as List?)?.isNotEmpty == true
           ? res.data['data'][0] as Map<String, dynamic>
           : null;
+      if (record == null) return;
 
-      if (record == null) {
-        // Not checked in today
-        isCheckedIn.value = false;
-        checkInTime.value = null;
-        checkOutTime.value = null;
-        return;
-      }
-
-      // Parse punch times — backend uses punchInTime / punchOutTime
       final punchIn = record['punchInTime'] ?? record['punchInTimeIST'];
       final punchOut = record['punchOutTime'] ?? record['punchOutTimeIST'];
-
-      if (punchIn != null) {
+      if (punchIn != null)
         checkInTime.value = DateTime.tryParse(punchIn.toString());
-      }
-      if (punchOut != null) {
+      if (punchOut != null)
         checkOutTime.value = DateTime.tryParse(punchOut.toString());
-      }
 
       if (checkInTime.value != null && checkOutTime.value == null) {
-        // Currently checked in — start elapsed timer
         isCheckedIn.value = true;
-        final elapsed = DateTime.now().difference(checkInTime.value!);
-        elapsedSecs.value = elapsed.inSeconds;
+        elapsedSecs.value =
+            DateTime.now().difference(checkInTime.value!).inSeconds;
         _elapsedTimer?.cancel();
         _elapsedTimer = Timer.periodic(
             const Duration(seconds: 1), (_) => elapsedSecs.value++);
       } else if (checkOutTime.value != null) {
         isCheckedIn.value = false;
-        final elapsed = checkOutTime.value!.difference(checkInTime.value!);
-        elapsedSecs.value = elapsed.inSeconds;
+        elapsedSecs.value =
+            checkOutTime.value!.difference(checkInTime.value!).inSeconds;
       }
-    } catch (_) {
-      // Silently fail — UI shows default "not checked in" state
-    }
+    } catch (_) {}
   }
 
-  /// Punch in via POST /api/v1/attendance/punch-in
   Future<void> checkIn() async {
     if (isPunching.value) return;
     isPunching.value = true;
-
     try {
       await _dio.post('/api/v1/attendance/punch-in', data: {});
-
       checkInTime.value = DateTime.now();
       checkOutTime.value = null;
       isCheckedIn.value = true;
@@ -117,15 +95,13 @@ class AttendanceController extends GetxController {
       _elapsedTimer?.cancel();
       _elapsedTimer = Timer.periodic(
           const Duration(seconds: 1), (_) => elapsedSecs.value++);
-
-      Get.snackbar('Checked In', 'Attendance recorded successfully.',
+      Get.snackbar('Checked In', 'Attendance recorded.',
           backgroundColor: AppColors.success,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
           margin: const EdgeInsets.all(16));
     } on DioException catch (e) {
-      final msg = ApiFailure.fromDioException(e).message;
-      Get.snackbar('Check-in Failed', msg,
+      Get.snackbar('Failed', ApiFailure.fromDioException(e).message,
           backgroundColor: AppColors.danger,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
@@ -135,26 +111,21 @@ class AttendanceController extends GetxController {
     }
   }
 
-  /// Punch out via POST /api/v1/attendance/punch-out
   Future<void> checkOut() async {
     if (isPunching.value) return;
     isPunching.value = true;
-
     try {
       await _dio.post('/api/v1/attendance/punch-out', data: {});
-
       checkOutTime.value = DateTime.now();
       isCheckedIn.value = false;
       _elapsedTimer?.cancel();
-
-      Get.snackbar('Checked Out', 'Attendance recorded successfully.',
+      Get.snackbar('Checked Out', 'Attendance recorded.',
           backgroundColor: AppColors.info,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
           margin: const EdgeInsets.all(16));
     } on DioException catch (e) {
-      final msg = ApiFailure.fromDioException(e).message;
-      Get.snackbar('Check-out Failed', msg,
+      Get.snackbar('Failed', ApiFailure.fromDioException(e).message,
           backgroundColor: AppColors.danger,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
@@ -648,17 +619,28 @@ class DashboardPage extends StatelessWidget {
           sliver: SliverList(
               delegate: SliverChildListDelegate([
             const SizedBox(height: 16),
+            // ── Workforce Stats Cards ──────────────────────────────────────
+            Obx(() => ctrl.workforce.value != null
+                ? _WorkforceStatsGrid(ctrl: ctrl)
+                : const SizedBox.shrink()),
+            const SizedBox(height: 16),
+            // ── Secondary KPI Row ──────────────────────────────────────────
+            Obx(() => ctrl.workforce.value != null
+                ? _SecondaryKpiRow(ctrl: ctrl)
+                : const SizedBox.shrink()),
+            const SizedBox(height: 16),
+            // ── Supervisor Pipeline (if available) ─────────────────────────
             Obx(() => ctrl.supervisorMetrics.value != null
                 ? _HeroCards(ctrl: ctrl)
                 : const SizedBox.shrink()),
             const SizedBox(height: 16),
-            Obx(() => ctrl.workforceStats.value != null
-                ? _KpiRow(ctrl: ctrl)
-                : const SizedBox.shrink()),
-            const SizedBox(height: 16),
+            // ── Employee List ──────────────────────────────────────────────
             _EmployeeQuickList(t: t),
             const SizedBox(height: 16),
-            _RecentOnboarding(ctrl: ctrl, t: t),
+            // ── Recent Onboarding ──────────────────────────────────────────
+            Obx(() => ctrl.recentOnboarding.isNotEmpty
+                ? _RecentOnboardingSection(ctrl: ctrl, t: t)
+                : const SizedBox.shrink()),
             const SizedBox(height: 16),
             Obx(() => ctrl.pendingApprovals.isNotEmpty
                 ? _PendingTile(ctrl: ctrl)
@@ -954,6 +936,278 @@ class _QuickEmpRow extends StatelessWidget {
 }
 
 // ── Hero Cards — reads t directly, no Obx wrapper ─────────────────────────────
+// ── Workforce Stats Grid (matches web portal) ─────────────────────────────────
+class _WorkforceStatsGrid extends StatelessWidget {
+  final DashboardController ctrl;
+  const _WorkforceStatsGrid({required this.ctrl});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = ThemeController.to;
+    final w = ctrl.workforce.value!;
+    return Column(children: [
+      // Row 1: Total, Deployed, Unassigned, Pending Onboarding
+      Row(children: [
+        Expanded(
+            child: _StatCard(
+                title: 'Total Workforce',
+                value: w.totalEmployees.toString(),
+                subtitle: '${w.working} working',
+                icon: Icons.people_rounded,
+                color: AppColors.accent,
+                borderColor: AppColors.accent,
+                t: t)),
+        const SizedBox(width: 10),
+        Expanded(
+            child: _StatCard(
+                title: 'Deployed',
+                value: w.deployed.toString(),
+                subtitle: 'Billable',
+                icon: Icons.business_center_rounded,
+                color: AppColors.success,
+                borderColor: AppColors.success,
+                t: t)),
+      ]),
+      const SizedBox(height: 10),
+      Row(children: [
+        Expanded(
+            child: _StatCard(
+                title: 'Unassigned',
+                value: w.unassigned.toString(),
+                subtitle: '${w.unassignedPct.toStringAsFixed(0)}% of working',
+                icon: Icons.warning_amber_rounded,
+                color: AppColors.warning,
+                borderColor: AppColors.warning,
+                t: t)),
+        const SizedBox(width: 10),
+        Expanded(
+            child: _StatCard(
+                title: 'Pending\nOnboarding',
+                value: w.pendingOnboarding.toString(),
+                subtitle: 'Awaiting approval',
+                icon: Icons.schedule_rounded,
+                color: AppColors.info,
+                borderColor: AppColors.info,
+                t: t)),
+      ]),
+      const SizedBox(height: 10),
+      // Row 2: Pending Salary, Rejected, Deactivated
+      Row(children: [
+        Expanded(
+            child: _StatCard(
+                title: 'Pending Salary\nSetup',
+                value: w.pendingSalarySetup.toString(),
+                subtitle: 'Awaiting compensation',
+                icon: Icons.attach_money_rounded,
+                color: const Color(0xFFD97706),
+                borderColor: const Color(0xFFD97706),
+                t: t)),
+        const SizedBox(width: 10),
+        Expanded(
+            child: _StatCard(
+                title: 'Rejected',
+                value: w.rejected.toString(),
+                subtitle: '',
+                icon: Icons.cancel_outlined,
+                color: AppColors.danger,
+                borderColor: AppColors.danger,
+                t: t)),
+      ]),
+      const SizedBox(height: 10),
+      Row(children: [
+        Expanded(
+            child: _StatCard(
+                title: 'Deactivated',
+                value: w.deactivated.toString(),
+                subtitle: '',
+                icon: Icons.person_off_rounded,
+                color: const Color(0xFF6B7280),
+                borderColor: const Color(0xFF6B7280),
+                t: t)),
+        const Expanded(child: SizedBox()), // spacer
+      ]),
+    ]);
+  }
+}
+
+class _StatCard extends StatelessWidget {
+  final String title, value, subtitle;
+  final IconData icon;
+  final Color color, borderColor;
+  final ThemeController t;
+  const _StatCard(
+      {required this.title,
+      required this.value,
+      required this.subtitle,
+      required this.icon,
+      required this.color,
+      required this.borderColor,
+      required this.t});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: t.surface,
+        borderRadius: BorderRadius.circular(AppRadius.lg),
+        border: Border.all(color: t.border),
+        boxShadow: t.cardShadow,
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // Top color accent bar
+        Container(
+            height: 3,
+            width: 40,
+            decoration: BoxDecoration(
+                color: borderColor,
+                borderRadius: BorderRadius.circular(AppRadius.full))),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                Text(title,
+                    style: AppTextStyles.caption.copyWith(
+                        color: t.textSec,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w500,
+                        height: 1.3)),
+                const SizedBox(height: 4),
+                Text(value,
+                    style: AppTextStyles.numericLarge.copyWith(
+                        color: t.textPrimary,
+                        fontSize: 28,
+                        fontWeight: FontWeight.w700)),
+                if (subtitle.isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  Text(subtitle,
+                      style: AppTextStyles.caption
+                          .copyWith(color: t.textTert, fontSize: 10)),
+                ],
+              ])),
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(AppRadius.md),
+            ),
+            child: Icon(icon, color: color, size: 20),
+          ),
+        ]),
+      ]),
+    );
+  }
+}
+
+// ── Secondary KPI Row (Working / Unassigned Ratio / On Probation / New Joiners / Exits) ──
+class _SecondaryKpiRow extends StatelessWidget {
+  final DashboardController ctrl;
+  const _SecondaryKpiRow({required this.ctrl});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = ThemeController.to;
+    final w = ctrl.workforce.value!;
+    return Container(
+      decoration: BoxDecoration(
+          color: t.surface,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: t.border),
+          boxShadow: t.cardShadow),
+      child: IntrinsicHeight(
+          child: Row(children: [
+        _kpiCell('${w.working}', 'Working', t),
+        _divider(t),
+        _kpiCell(
+            '${w.unassignedPct.toStringAsFixed(0)}%', 'Unassigned Ratio', t),
+        _divider(t),
+        _kpiCell('${w.onProbation}', 'On Probation', t),
+        _divider(t),
+        _kpiCell('${w.newJoinersThisMonth}', 'New Joiners (mo)', t),
+        _divider(t),
+        _kpiCell('${w.exitsThisMonth}', 'Exits (mo)', t),
+      ])),
+    );
+  }
+
+  Widget _kpiCell(String value, String label, ThemeController t) => Expanded(
+          child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Text(value,
+              style: AppTextStyles.numericMedium.copyWith(
+                  color: t.textPrimary,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700)),
+          const SizedBox(height: 2),
+          Text(label,
+              style:
+                  AppTextStyles.caption.copyWith(color: t.textSec, fontSize: 9),
+              textAlign: TextAlign.center),
+        ]),
+      ));
+
+  Widget _divider(ThemeController t) => Container(width: 1, color: t.border);
+}
+
+// ── Recent Onboarding Section (from real API data.recentOnboarding) ────────────
+class _RecentOnboardingSection extends StatelessWidget {
+  final DashboardController ctrl;
+  final ThemeController t;
+  const _RecentOnboardingSection({required this.ctrl, required this.t});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+          color: t.surface,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: t.border),
+          boxShadow: t.cardShadow),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Text('Recent Onboarding',
+              style: AppTextStyles.headingSmall.copyWith(color: t.textPrimary)),
+          const Spacer(),
+          Text('${ctrl.recentOnboarding.length} records',
+              style: AppTextStyles.caption.copyWith(color: t.textTert)),
+        ]),
+        const SizedBox(height: 12),
+        ...ctrl.recentOnboarding.map((e) => Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(children: [
+                CircleAvatar(
+                    radius: 16,
+                    backgroundColor: AppColors.accentLight,
+                    child: Text(
+                        e.name.isNotEmpty ? e.name[0].toUpperCase() : '?',
+                        style: AppTextStyles.caption.copyWith(
+                            color: AppColors.accent,
+                            fontWeight: FontWeight.w700))),
+                const SizedBox(width: 10),
+                Expanded(
+                    child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                      Text(e.name,
+                          style: AppTextStyles.bodySmall.copyWith(
+                              color: t.textPrimary,
+                              fontWeight: FontWeight.w600)),
+                      Text('ID: ${e.employeeId}',
+                          style: AppTextStyles.caption
+                              .copyWith(color: t.textTert, fontSize: 10)),
+                    ])),
+                StatusBadge(status: e.status),
+              ]),
+            )),
+      ]),
+    );
+  }
+}
+
 class _HeroCards extends StatelessWidget {
   final DashboardController ctrl;
   const _HeroCards({required this.ctrl});
@@ -1204,19 +1458,13 @@ class _RecentOnboarding extends StatelessWidget {
               ])),
           Divider(height: 1, color: t.border),
           ...ctrl.recentOnboarding.map((row) {
-            final initials = (row.fullName as String).isNotEmpty
-                ? (row.fullName as String)
+            final initials = row.name.isNotEmpty
+                ? row.name
                     .split(' ')
                     .take(2)
                     .map((w) => w.isNotEmpty ? w[0] : '')
                     .join()
                 : '?';
-            final tc = _typeColors[row.employmentType as String?] ??
-                (
-                  t.surfaceVar,
-                  t.textSec,
-                  (row.employmentType as String?) ?? ''
-                );
             return Column(children: [
               Padding(
                 padding:
@@ -1235,36 +1483,17 @@ class _RecentOnboarding extends StatelessWidget {
                           children: [
                         Row(children: [
                           Expanded(
-                              child: Text(row.fullName as String,
+                              child: Text(row.name,
                                   style: AppTextStyles.bodySmall.copyWith(
                                       fontWeight: FontWeight.w600,
                                       color: t.textPrimary))),
-                          StatusBadge(status: row.status as String),
+                          StatusBadge(status: row.status),
                         ]),
                         const SizedBox(height: 3),
                         Row(children: [
-                          if ((row.client as String?) != null) ...[
-                            Icon(Icons.business_outlined,
-                                size: 11, color: t.textTert),
-                            const SizedBox(width: 3),
-                            Text(row.client as String,
-                                style: AppTextStyles.caption
-                                    .copyWith(color: t.textSec, fontSize: 11)),
-                            const SizedBox(width: 6),
-                          ],
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 5, vertical: 1),
-                            decoration: BoxDecoration(
-                                color: tc.$1,
-                                borderRadius:
-                                    BorderRadius.circular(AppRadius.full)),
-                            child: Text(tc.$3,
-                                style: AppTextStyles.caption.copyWith(
-                                    color: tc.$2,
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.w600)),
-                          ),
+                          Text('ID: ${row.employeeId}',
+                              style: AppTextStyles.caption
+                                  .copyWith(color: t.textSec, fontSize: 11)),
                         ]),
                       ])),
                 ]),
@@ -1648,12 +1877,13 @@ class _CheckButton extends StatelessWidget {
             ],
           ),
           child: punching
-              ? const SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(
-                      strokeWidth: 2.5,
-                      valueColor: AlwaysStoppedAnimation(Colors.white)))
+              ? const Center(
+                  child: SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2.5,
+                          valueColor: AlwaysStoppedAnimation(Colors.white))))
               : Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                   Icon(chk ? Icons.logout_rounded : Icons.login_rounded,
                       color: Colors.white, size: 22),

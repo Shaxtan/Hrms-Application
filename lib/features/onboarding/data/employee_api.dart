@@ -37,8 +37,8 @@ class EmployeeApi {
   Future<Map<String, dynamic>> finalizeEmployeeCreation(
     int employeeId,
   ) async {
-    final res = await _dio.post(
-        '/api/v1/employees/$employeeId/finalize-creation');
+    final res =
+        await _dio.post('/api/v1/employees/$employeeId/finalize-creation');
     return res.data as Map<String, dynamic>;
   }
 
@@ -52,10 +52,12 @@ class EmployeeApi {
     int employeeId,
     File file,
   ) async {
+    final bytes = await file.readAsBytes();
+    final fileName = file.path.split('/').last.split('\\').last;
     final formData = FormData.fromMap({
-      'photo': await MultipartFile.fromFile(
-        file.path,
-        filename: 'photo.jpg',
+      'photo': MultipartFile.fromBytes(
+        bytes,
+        filename: fileName.isNotEmpty ? fileName : 'photo.jpg',
       ),
     });
     final res = await _dio.post(
@@ -143,15 +145,17 @@ class EmployeeApi {
     required File file,
     bool replaceExisting = true,
   }) async {
+    final bytes = await file.readAsBytes();
+    final fileName = file.path.split('/').last.split('\\').last;
     final formData = FormData.fromMap({
-      'file': await MultipartFile.fromFile(
-        file.path,
-        filename: file.path.split('/').last,
+      'file': MultipartFile.fromBytes(
+        bytes,
+        filename: fileName.isNotEmpty ? fileName : 'document.jpg',
       ),
-      'employeeId': employeeId,
+      'employeeId': employeeId.toString(),
       'documentCategory': documentCategory,
       'documentType': documentType,
-      'replaceExisting': replaceExisting,
+      'replaceExisting': replaceExisting.toString(),
     });
     final res = await _dio.post('/api/v1/documents/upload', data: formData);
     return res.data as Map<String, dynamic>;
@@ -225,7 +229,6 @@ class EmployeeApi {
   }
 
   Future<void> rejectOnboarding(int id, String? reason) async {
-    await _dio.post(
-        '/api/v1/employees/$id/reject', data: {'reason': reason});
+    await _dio.post('/api/v1/employees/$id/reject', data: {'reason': reason});
   }
 }
