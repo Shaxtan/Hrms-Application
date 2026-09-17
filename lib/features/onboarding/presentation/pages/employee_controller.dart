@@ -52,6 +52,7 @@ class EmployeeController extends GetxController {
                 designation: s.designation,
                 department: s.department,
                 branch: s.branch,
+                profilePhotoUrl: s.profilePhotoUrl,
               ))
           .toList();
       totalRecords.value = res.totalRecords ?? employees.length;

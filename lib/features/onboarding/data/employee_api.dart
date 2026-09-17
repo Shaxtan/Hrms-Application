@@ -167,6 +167,65 @@ class EmployeeApi {
     return res.data as Map<String, dynamic>;
   }
 
+  // ── Get single employee by ID ────────────────────────────────────────────
+  Future<Map<String, dynamic>> getEmployeeById(int id) async {
+    final res = await _dio.get('/api/v1/employees/$id');
+    return res.data as Map<String, dynamic>;
+  }
+
+  // ── Patch (update) employee ──────────────────────────────────────────────
+  Future<Map<String, dynamic>> patchEmployee(
+    int employeeId,
+    Map<String, dynamic> payload,
+  ) async {
+    final res = await _dio.patch(
+      '/api/v1/employees/$employeeId',
+      data: payload,
+    );
+    return res.data as Map<String, dynamic>;
+  }
+
+  // ── Get employee documents ───────────────────────────────────────────────
+  Future<List<dynamic>> getEmployeeDocuments(int employeeId) async {
+    final res = await _dio.post('/api/v1/documents/list', data: {
+      'page': 0,
+      'size': 50,
+      'sortBy': 'createdAt',
+      'sortDir': 'DESC',
+      'filters': {'employeeId': employeeId},
+    });
+    return (res.data?['data'] as List?) ?? [];
+  }
+
+  // ── Get family members ───────────────────────────────────────────────────
+  Future<List<dynamic>> getFamilyMembers(int employeeId) async {
+    final res = await _dio.get('/api/v1/employees/$employeeId/family-members');
+    return (res.data?['data'] as List?) ?? [];
+  }
+
+  // ── Get emergency contacts ───────────────────────────────────────────────
+  Future<List<dynamic>> getEmergencyContacts(int employeeId) async {
+    final res =
+        await _dio.get('/api/v1/employees/$employeeId/emergency-contacts');
+    return (res.data?['data'] as List?) ?? [];
+  }
+
+  // ── Get bank accounts ────────────────────────────────────────────────────
+  Future<List<dynamic>> getBankAccounts(int employeeId) async {
+    final res = await _dio.get('/api/v1/employees/$employeeId/bank-accounts');
+    return (res.data?['data'] as List?) ?? [];
+  }
+
+  // ── Build authenticated photo URL ────────────────────────────────────────
+  static String buildPhotoUrl(String? profilePhotoUrl, int employeeId) {
+    if (profilePhotoUrl != null && profilePhotoUrl.isNotEmpty) {
+      if (profilePhotoUrl.startsWith('http')) return profilePhotoUrl;
+      // Relative URL — prepend the core service base
+      return 'http://103.139.58.189:8081$profilePhotoUrl';
+    }
+    return 'http://103.139.58.189:8081/api/v1/employees/$employeeId/photo';
+  }
+
   // ── Client companies ──────────────────────────────────────────────────────
   Future<List<ClientCompany>> getClientCompanies() async {
     final res = await _dio.post(

@@ -15,6 +15,7 @@ class Employee {
   final String? branch;
   final String? client;
   final String? joiningDate;
+  final String? profilePhotoUrl;
   final String? bloodGroup;
   final String? gender;
   final String? maritalStatus;
@@ -42,6 +43,7 @@ class Employee {
     this.branch,
     this.client,
     this.joiningDate,
+    this.profilePhotoUrl,
     this.bloodGroup,
     this.gender,
     this.maritalStatus,
@@ -109,6 +111,7 @@ class Employee {
       bankAccount: bankAccount ?? this.bankAccount,
       ifsc: ifsc ?? this.ifsc,
       fatherName: fatherName ?? this.fatherName,
+      profilePhotoUrl: profilePhotoUrl ?? this.profilePhotoUrl,
     );
   }
 }
