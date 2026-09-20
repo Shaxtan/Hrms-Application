@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:dio/dio.dart';
@@ -7,7 +6,12 @@ import '../../../../core/theme/app_theme.dart';
 import '../../../../core/network/api_client.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AUTH CONTROLLER — real API login via POST /api/v1/auth/login
+// AUTH CONTROLLER — real API: POST /api/v1/auth/login
+//
+// Login response shape (from the web's LoginPage.jsx → acceptAuthenticatedResponse):
+//   { data: { accessToken, employee: { employeeId, fullName, firstName, lastName, email, ... },
+//             company: { tenantId, tenantName, logoUrl, ... },
+//             accessibleCompanies: [...] } }
 // ═══════════════════════════════════════════════════════════════════════════════
 class AuthController extends GetxController {
   static AuthController get to => Get.find();
@@ -20,32 +24,7 @@ class AuthController extends GetxController {
   final userRole = ''.obs;
   final userInitials = ''.obs;
   final companyName = ''.obs;
-
-  // Stored IDs for header injection
-  String? _tenantId;
-  String? _branchId;
-  int? _employeeId;
-
-  int? get employeeId => _employeeId;
-
-  /// Extract role from various possible response shapes.
-  static String _extractRole(Map<String, dynamic> user) {
-    // Could be: role (string), roles (list of strings), authorities (list of maps)
-    if (user['role'] is String) return user['role'];
-    if (user['roles'] is List && (user['roles'] as List).isNotEmpty) {
-      final first = (user['roles'] as List).first;
-      if (first is String) return first;
-      if (first is Map) return first['name'] ?? first['authority'] ?? '';
-    }
-    if (user['authorities'] is List &&
-        (user['authorities'] as List).isNotEmpty) {
-      final first = (user['authorities'] as List).first;
-      if (first is String) return first.replaceFirst('ROLE_', '');
-      if (first is Map)
-        return (first['authority'] ?? '').toString().replaceFirst('ROLE_', '');
-    }
-    return '';
-  }
+  final userEmail = ''.obs;
 
   String get roleDisplay {
     switch (userRole.value) {
@@ -70,101 +49,119 @@ class AuthController extends GetxController {
     _tryRestoreSession();
   }
 
-  /// Try to restore a previous session from secure storage.
   Future<void> _tryRestoreSession() async {
     final token = await _storage.read(key: 'auth_token');
     if (token == null) return;
 
-    final name = await _storage.read(key: 'user_name') ?? '';
-    final role = await _storage.read(key: 'user_role') ?? '';
-    final company = await _storage.read(key: 'company_name') ?? '';
-    final initials = await _storage.read(key: 'user_initials') ?? '';
-    _tenantId = await _storage.read(key: 'tenant_id');
-    _branchId = await _storage.read(key: 'branch_id');
-    final empIdStr = await _storage.read(key: 'employee_id');
-    _employeeId = empIdStr != null ? int.tryParse(empIdStr) : null;
-
-    userName.value = name;
-    userRole.value = role;
-    userInitials.value = initials;
-    companyName.value = company;
+    userName.value = await _storage.read(key: 'user_name') ?? '';
+    userRole.value = await _storage.read(key: 'user_role') ?? '';
+    companyName.value = await _storage.read(key: 'company_name') ?? '';
+    userInitials.value = await _storage.read(key: 'user_initials') ?? '';
+    userEmail.value = await _storage.read(key: 'user_email') ?? '';
     isLoggedIn.value = true;
 
-    // Navigate to home if currently on login
-    if (Get.currentRoute == '/login') {
-      Get.offAllNamed('/home');
+    // If name is empty, try decoding from JWT
+    if (userName.value.isEmpty) {
+      final claims = ApiClient.decodeJwtPayload(token);
+      final sub = claims['sub']?.toString() ?? '';
+      if (sub.contains('@')) {
+        userName.value = sub.split('@').first;
+        userInitials.value =
+            userName.value.isNotEmpty ? userName.value[0].toUpperCase() : 'U';
+      }
     }
+
+    // Fetch company name if not stored
+    if (companyName.value.isEmpty) _fetchCompanyName();
+    // Fetch real name if not stored
+    if (userName.value.isEmpty || userName.value == 'User') _fetchMyProfile();
+
+    if (Get.currentRoute == '/login') Get.offAllNamed('/home');
   }
 
-  /// Real login: POST /api/v1/auth/login
   Future<void> login(String email, String password) async {
     errorMessage.value = '';
     isLoading.value = true;
 
     try {
-      final dio = ApiClient.instance;
-      final res = await dio.post('/api/v1/auth/login', data: {
+      final res = await ApiClient.instance.post('/api/v1/auth/login', data: {
         'email': email.trim(),
         'password': password,
       });
 
       final body = res.data as Map<String, dynamic>;
 
-      // DEBUG: print the full response so we can see the actual shape
-      debugPrint('LOGIN RESPONSE: $body');
-      debugPrint('LOGIN RESPONSE KEYS: ${body.keys.toList()}');
-      if (body['data'] != null)
-        debugPrint('LOGIN DATA KEYS: ${(body['data'] as Map?)?.keys.toList()}');
-      // The response envelope may or may not have a 'data' wrapper.
-      // Try both: body['data'] (wrapped) and body itself (flat).
-      final Map<String, dynamic> data;
-      if (body['data'] is Map<String, dynamic>) {
-        data = body['data'] as Map<String, dynamic>;
-      } else {
-        data = body;
-      }
+      // Unwrap: body itself or body['data']
+      final Map<String, dynamic> data = body['data'] is Map<String, dynamic>
+          ? body['data'] as Map<String, dynamic>
+          : body;
 
-      // Token can be at data.accessToken or data.token
-      final token = (data['accessToken'] ?? data['token']) as String?;
-
+      // Token
+      final token = (data['accessToken'] ??
+          data['token'] ??
+          body['accessToken']) as String?;
       if (token == null || token.isEmpty) {
-        errorMessage.value =
-            body['message'] ?? 'Login failed — no token received.';
+        errorMessage.value = body['message'] ?? 'No token received.';
         isLoading.value = false;
         return;
       }
 
-      // DEBUG: print JWT claims to see tenantId, branchId, role etc.
-      debugPrint('JWT CLAIMS: ${ApiClient.decodeJwtPayload(token)}');
+      // Decode JWT for authoritative claims
+      final jwt = ApiClient.decodeJwtPayload(token);
+      debugPrint('JWT CLAIMS: $jwt');
 
-      // User object can be nested under 'user' or flat in data
-      final Map<String, dynamic> user;
-      if (data['user'] is Map<String, dynamic>) {
-        user = data['user'] as Map<String, dynamic>;
-      } else {
-        user = data;
+      // Employee object (may be absent for PLATFORM_ADMIN)
+      final emp = data['employee'] as Map<String, dynamic>? ?? {};
+      // Company object
+      final company = data['company'] as Map<String, dynamic>? ?? {};
+
+      // Name: prefer employee fields, fall back to JWT sub
+      String name = '${emp['firstName'] ?? ''} ${emp['lastName'] ?? ''}'.trim();
+      if (name.isEmpty) name = (emp['fullName'] ?? '').toString().trim();
+      if (name.isEmpty) {
+        // Fall back to JWT 'sub' (usually email) or 'name' claim
+        final sub = jwt['sub']?.toString() ?? '';
+        name = jwt['name']?.toString() ??
+            (sub.contains('@') ? sub.split('@').first : sub);
       }
 
-      final name =
-          '${user['firstName'] ?? ''} ${user['lastName'] ?? ''}'.trim();
-      final role = _extractRole(user);
-      final tenantId = (user['tenantId'] ?? data['tenantId'])?.toString() ??
-          ApiClient.getTenantIdFromToken(token);
-      final branchId = (user['branchId'] ?? data['branchId'])?.toString() ??
-          ApiClient.getBranchIdFromToken(token);
-      final empId = (user['employeeId'] ?? data['employeeId'])?.toString();
-      final company = (user['companyName'] ??
-          user['tenantName'] ??
-          data['companyName'] ??
-          '') as String;
+      // Role: from JWT (authoritative), fall back to employee/data
+      final roles = ApiClient.getRolesFromToken(token);
+      final role = roles.isNotEmpty
+          ? roles.first
+          : (emp['role'] ?? data['role'] ?? '').toString();
 
-      // Compute initials
+      // Tenant ID: from company object, fall back to JWT
+      final tenantId =
+          (company['tenantId'] ?? company['id'] ?? data['tenantId'])
+                  ?.toString() ??
+              ApiClient.getTenantIdFromToken(token);
+
+      // Branch ID: from JWT
+      final branchId = ApiClient.getBranchIdFromToken(token);
+
+      // Employee ID
+      final empId =
+          (emp['employeeId'] ?? emp['id'] ?? data['employeeId'])?.toString() ??
+              ApiClient.getEmployeeIdFromToken(token)?.toString();
+
+      // Company name
+      final companyStr = (company['tenantName'] ??
+              company['companyName'] ??
+              data['tenantName'] ??
+              '')
+          .toString();
+
+      // Email
+      final emailStr = (emp['email'] ?? jwt['sub'] ?? email).toString();
+
+      // Initials
       final parts = name.split(' ').where((w) => w.isNotEmpty).toList();
       final initials = parts.length >= 2
           ? '${parts[0][0]}${parts[1][0]}'.toUpperCase()
           : (parts.isNotEmpty ? parts[0][0].toUpperCase() : 'U');
 
-      // Persist to secure storage
+      // Persist
       await _storage.write(key: 'auth_token', value: token);
       if (tenantId != null)
         await _storage.write(key: 'tenant_id', value: tenantId);
@@ -174,31 +171,31 @@ class AuthController extends GetxController {
       await _storage.write(key: 'user_name', value: name);
       await _storage.write(key: 'user_role', value: role);
       await _storage.write(key: 'user_initials', value: initials);
-      await _storage.write(key: 'company_name', value: company);
-
-      _tenantId = tenantId;
-      _branchId = branchId;
-      _employeeId = empId != null ? int.tryParse(empId) : null;
+      await _storage.write(key: 'company_name', value: companyStr);
+      await _storage.write(key: 'user_email', value: emailStr);
 
       userName.value = name;
       userRole.value = role;
       userInitials.value = initials;
-      companyName.value = company;
+      companyName.value = companyStr;
+      userEmail.value = emailStr;
       isLoggedIn.value = true;
-
       isLoading.value = false;
+
       Get.offAllNamed('/home');
+
+      // Fetch company name from API if not in login response
+      if (companyName.value.isEmpty) _fetchCompanyName();
+      // Fetch real user name if login response didn't include it
+      if (userName.value.isEmpty || userName.value == 'User') _fetchMyProfile();
     } on DioException catch (e) {
-      final data = e.response?.data;
-      if (data is Map && data['message'] != null) {
-        errorMessage.value = data['message'];
-      } else if (e.type == DioExceptionType.connectionTimeout ||
-          e.type == DioExceptionType.receiveTimeout) {
-        errorMessage.value = 'Connection timed out. Please try again.';
+      final d = e.response?.data;
+      if (d is Map && d['message'] != null) {
+        errorMessage.value = d['message'];
       } else if (e.type == DioExceptionType.connectionError) {
         errorMessage.value = 'Cannot reach server. Check your connection.';
       } else {
-        errorMessage.value = e.message ?? 'Login failed. Please try again.';
+        errorMessage.value = e.message ?? 'Login failed.';
       }
       isLoading.value = false;
     } catch (e) {
@@ -208,29 +205,77 @@ class AuthController extends GetxController {
   }
 
   Future<void> logout() async {
-    // Best-effort server logout
     try {
       await ApiClient.instance.post('/api/v1/auth/logout');
     } catch (_) {}
-
     await _storage.deleteAll();
-    _tenantId = null;
-    _branchId = null;
-    _employeeId = null;
-
     isLoggedIn.value = false;
     userName.value = '';
     userRole.value = '';
     userInitials.value = '';
     companyName.value = '';
+    userEmail.value = '';
     errorMessage.value = '';
-
     Get.offAllNamed('/login');
+  }
+
+  /// Fetch company name from POST /api/v1/client-companies/list (platform module)
+  Future<void> _fetchCompanyName() async {
+    try {
+      final res =
+          await ApiClient.instance.post('/api/v1/client-companies/list', data: {
+        'page': 0,
+        'size': 1,
+        'sortBy': 'clientName',
+        'sortDir': 'ASC',
+        'filters': {},
+      });
+      final list = res.data?['data'] as List?;
+      if (list != null && list.isNotEmpty) {
+        final name = (list.first['clientName'] ?? '').toString();
+        if (name.isNotEmpty) {
+          companyName.value = name;
+          await _storage.write(key: 'company_name', value: name);
+        }
+      }
+    } catch (_) {}
+  }
+
+  /// Fetch the logged-in user's profile from GET /api/v1/employees/me
+  /// to get the real name when the login response didn't include it.
+  Future<void> _fetchMyProfile() async {
+    try {
+      final res = await ApiClient.instance.get('/api/v1/employees/me');
+      final d = (res.data?['data'] ?? res.data) as Map<String, dynamic>?;
+      if (d == null) return;
+
+      String name = (d['fullName'] ?? '').toString().trim();
+      if (name.isEmpty)
+        name = '${d['firstName'] ?? ''} ${d['lastName'] ?? ''}'.trim();
+
+      if (name.isNotEmpty) {
+        final parts = name.split(' ').where((w) => w.isNotEmpty).toList();
+        final initials = parts.length >= 2
+            ? '${parts[0][0]}${parts[1][0]}'.toUpperCase()
+            : (parts.isNotEmpty ? parts[0][0].toUpperCase() : 'U');
+
+        userName.value = name;
+        userInitials.value = initials;
+        await _storage.write(key: 'user_name', value: name);
+        await _storage.write(key: 'user_initials', value: initials);
+      }
+
+      final email = (d['email'] ?? '').toString();
+      if (email.isNotEmpty && userEmail.value.isEmpty) {
+        userEmail.value = email;
+        await _storage.write(key: 'user_email', value: email);
+      }
+    } catch (_) {}
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// LOGIN PAGE (UI unchanged — just uses the updated AuthController)
+// LOGIN PAGE
 // ═══════════════════════════════════════════════════════════════════════════════
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
@@ -266,10 +311,7 @@ class _LoginPageState extends State<LoginPage>
 
   void _submit() {
     if (!_formKey.currentState!.validate()) return;
-    Get.find<AuthController>().login(
-      _emailCtrl.text,
-      _passCtrl.text,
-    );
+    Get.find<AuthController>().login(_emailCtrl.text, _passCtrl.text);
   }
 
   @override
@@ -279,33 +321,30 @@ class _LoginPageState extends State<LoginPage>
       return Scaffold(
         backgroundColor: t.bg,
         body: SafeArea(
-          child: Center(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: FadeTransition(
-                opacity: _fadeAnim,
-                child: Form(
+            child: Center(
+                child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: FadeTransition(
+              opacity: _fadeAnim,
+              child: Form(
                   key: _formKey,
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      // Logo area
                       Container(
-                        width: 72,
-                        height: 72,
-                        decoration: BoxDecoration(
-                          gradient: AppColors.accentGradient,
-                          borderRadius: BorderRadius.circular(20),
-                          boxShadow: [
-                            BoxShadow(
-                                color: AppColors.accent.withOpacity(0.3),
-                                blurRadius: 20,
-                                offset: const Offset(0, 8))
-                          ],
-                        ),
-                        child: const Icon(Icons.business_rounded,
-                            color: Colors.white, size: 36),
-                      ),
+                          width: 72,
+                          height: 72,
+                          decoration: BoxDecoration(
+                              gradient: AppColors.accentGradient,
+                              borderRadius: BorderRadius.circular(20),
+                              boxShadow: [
+                                BoxShadow(
+                                    color: AppColors.accent.withOpacity(0.3),
+                                    blurRadius: 20,
+                                    offset: const Offset(0, 8))
+                              ]),
+                          child: const Icon(Icons.business_rounded,
+                              color: Colors.white, size: 36)),
                       const SizedBox(height: 24),
                       Text('Welcome back',
                           style: AppTextStyles.displayMedium
@@ -315,142 +354,126 @@ class _LoginPageState extends State<LoginPage>
                           style: AppTextStyles.bodyMedium
                               .copyWith(color: t.textSec)),
                       const SizedBox(height: 36),
-
                       // Error
                       Obx(() {
                         final err =
                             Get.find<AuthController>().errorMessage.value;
                         if (err.isEmpty) return const SizedBox.shrink();
                         return Container(
-                          width: double.infinity,
-                          margin: const EdgeInsets.only(bottom: 16),
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: AppColors.dangerLight,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(
-                                color: AppColors.danger.withOpacity(0.3)),
-                          ),
-                          child: Row(children: [
-                            const Icon(Icons.error_outline_rounded,
-                                color: AppColors.danger, size: 18),
-                            const SizedBox(width: 8),
-                            Expanded(
-                                child: Text(err,
-                                    style: AppTextStyles.bodySmall
-                                        .copyWith(color: AppColors.danger))),
-                          ]),
-                        );
+                            width: double.infinity,
+                            margin: const EdgeInsets.only(bottom: 16),
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                                color: AppColors.dangerLight,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                    color: AppColors.danger.withOpacity(0.3))),
+                            child: Row(children: [
+                              const Icon(Icons.error_outline_rounded,
+                                  color: AppColors.danger, size: 18),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                  child: Text(err,
+                                      style: AppTextStyles.bodySmall
+                                          .copyWith(color: AppColors.danger))),
+                            ]));
                       }),
-
                       // Email
                       TextFormField(
-                        controller: _emailCtrl,
-                        keyboardType: TextInputType.emailAddress,
-                        textInputAction: TextInputAction.next,
-                        style: AppTextStyles.bodyMedium
-                            .copyWith(color: t.textPrimary),
-                        decoration: InputDecoration(
-                          labelText: 'Email',
-                          prefixIcon: Icon(Icons.email_outlined,
-                              color: t.textTert, size: 20),
-                          filled: true,
-                          fillColor: t.surfaceVar,
-                          border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(14),
-                              borderSide: BorderSide(color: t.border)),
-                          enabledBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(14),
-                              borderSide: BorderSide(color: t.border)),
-                          focusedBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(14),
-                              borderSide: const BorderSide(
-                                  color: AppColors.accent, width: 2)),
-                        ),
-                        validator: (v) => (v == null || v.trim().isEmpty)
-                            ? 'Email is required'
-                            : null,
-                      ),
+                          controller: _emailCtrl,
+                          keyboardType: TextInputType.emailAddress,
+                          textInputAction: TextInputAction.next,
+                          style: AppTextStyles.bodyMedium
+                              .copyWith(color: t.textPrimary),
+                          decoration: InputDecoration(
+                              labelText: 'Email',
+                              prefixIcon: Icon(Icons.email_outlined,
+                                  color: t.textTert, size: 20),
+                              filled: true,
+                              fillColor: t.surfaceVar,
+                              border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                  borderSide: BorderSide(color: t.border)),
+                              enabledBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                  borderSide: BorderSide(color: t.border)),
+                              focusedBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                  borderSide: const BorderSide(
+                                      color: AppColors.accent, width: 2))),
+                          validator: (v) => (v == null || v.trim().isEmpty)
+                              ? 'Email is required'
+                              : null),
                       const SizedBox(height: 16),
-
                       // Password
                       TextFormField(
-                        controller: _passCtrl,
-                        obscureText: _obscure,
-                        textInputAction: TextInputAction.done,
-                        onFieldSubmitted: (_) => _submit(),
-                        style: AppTextStyles.bodyMedium
-                            .copyWith(color: t.textPrimary),
-                        decoration: InputDecoration(
-                          labelText: 'Password',
-                          prefixIcon: Icon(Icons.lock_outline_rounded,
-                              color: t.textTert, size: 20),
-                          suffixIcon: GestureDetector(
-                            onTap: () => setState(() => _obscure = !_obscure),
-                            child: Icon(
-                                _obscure
-                                    ? Icons.visibility_off_outlined
-                                    : Icons.visibility_outlined,
-                                color: t.textTert,
-                                size: 20),
-                          ),
-                          filled: true,
-                          fillColor: t.surfaceVar,
-                          border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(14),
-                              borderSide: BorderSide(color: t.border)),
-                          enabledBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(14),
-                              borderSide: BorderSide(color: t.border)),
-                          focusedBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(14),
-                              borderSide: const BorderSide(
-                                  color: AppColors.accent, width: 2)),
-                        ),
-                        validator: (v) => (v == null || v.isEmpty)
-                            ? 'Password is required'
-                            : null,
-                      ),
+                          controller: _passCtrl,
+                          obscureText: _obscure,
+                          textInputAction: TextInputAction.done,
+                          onFieldSubmitted: (_) => _submit(),
+                          style: AppTextStyles.bodyMedium
+                              .copyWith(color: t.textPrimary),
+                          decoration: InputDecoration(
+                              labelText: 'Password',
+                              prefixIcon: Icon(Icons.lock_outline_rounded,
+                                  color: t.textTert, size: 20),
+                              suffixIcon: GestureDetector(
+                                  onTap: () =>
+                                      setState(() => _obscure = !_obscure),
+                                  child: Icon(
+                                      _obscure
+                                          ? Icons.visibility_off_outlined
+                                          : Icons.visibility_outlined,
+                                      color: t.textTert,
+                                      size: 20)),
+                              filled: true,
+                              fillColor: t.surfaceVar,
+                              border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                  borderSide: BorderSide(color: t.border)),
+                              enabledBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                  borderSide: BorderSide(color: t.border)),
+                              focusedBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                  borderSide: const BorderSide(
+                                      color: AppColors.accent, width: 2))),
+                          validator: (v) => (v == null || v.isEmpty)
+                              ? 'Password is required'
+                              : null),
                       const SizedBox(height: 28),
-
                       // Submit
                       Obx(() {
                         final loading =
                             Get.find<AuthController>().isLoading.value;
                         return SizedBox(
-                          width: double.infinity,
-                          height: 52,
-                          child: ElevatedButton(
-                            onPressed: loading ? null : _submit,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: AppColors.accent,
-                              foregroundColor: Colors.white,
-                              shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(14)),
-                              elevation: 0,
-                            ),
-                            child: loading
-                                ? const SizedBox(
-                                    width: 22,
-                                    height: 22,
-                                    child: CircularProgressIndicator(
-                                        strokeWidth: 2.5,
-                                        valueColor: AlwaysStoppedAnimation(
-                                            Colors.white)))
-                                : Text('Sign in',
-                                    style: AppTextStyles.buttonMedium
-                                        .copyWith(color: Colors.white)),
-                          ),
-                        );
+                            width: double.infinity,
+                            height: 52,
+                            child: ElevatedButton(
+                                onPressed: loading ? null : _submit,
+                                style: ElevatedButton.styleFrom(
+                                    backgroundColor: AppColors.accent,
+                                    foregroundColor: Colors.white,
+                                    shape: RoundedRectangleBorder(
+                                        borderRadius:
+                                            BorderRadius.circular(14)),
+                                    elevation: 0),
+                                child: loading
+                                    ? const SizedBox(
+                                        width: 22,
+                                        height: 22,
+                                        child: CircularProgressIndicator(
+                                            strokeWidth: 2.5,
+                                            valueColor: AlwaysStoppedAnimation(
+                                                Colors.white)))
+                                    : Text('Sign in',
+                                        style: AppTextStyles.buttonMedium
+                                            .copyWith(color: Colors.white))));
                       }),
                       const SizedBox(height: 24),
                     ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
+                  ))),
+        ))),
       );
     });
   }

@@ -3,35 +3,20 @@ import 'package:dio/dio.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:logger/logger.dart';
 
-/// Mirrors the web frontend's 3-module consolidated backend topology:
+/// Mirrors the web frontend's 3-module consolidated backend topology.
 ///
 ///   platform (8080) — auth, settings, notification, approval
 ///   core     (8081) — employee, document, tracking, dashboard
-///   payroll  (8082) — attendance, leave, payroll, compliance, report, approvals-history
-///
-/// URL resolution uses ordered prefix matching identical to
-/// `src/config/apiConfig.js → PATH_PREFIX_TO_SERVICE`.
+///   payroll  (8082) — attendance, leave, payroll, compliance, report
 class ApiClient {
   static const _storage = FlutterSecureStorage();
   static final _logger = Logger();
 
-  /// Change this to your server IP / domain.
-  /// For local dev:  http://10.0.2.2  (Android emulator → host machine)
-  /// For device on same Wi-Fi: http://<your-machine-ip>
-  /// For production: https://hrms.auspreytech.com
   static const String _apiHost = 'http://103.139.58.189';
-
-  /// URL composition mode: 'port' for dev, 'path' for nginx production.
   static const String _apiMode = 'port';
 
-  // ── Module ports (port mode) / slug names (path mode) ───────────────────
-  static const _modulePorts = {
-    'platform': 8080,
-    'core': 8081,
-    'payroll': 8082,
-  };
+  static const _modulePorts = {'platform': 8090, 'core': 8091, 'payroll': 8092};
 
-  // ── Old logical service → new module mapping (same as web OLD_TO_NEW) ───
   static const _oldToNew = {
     'AUTH': 'platform',
     'SETTINGS': 'platform',
@@ -47,63 +32,38 @@ class ApiClient {
     'REPORT': 'payroll',
   };
 
-  /// Ordered prefix → service key table. More-specific prefixes FIRST.
-  /// Mirrors `PATH_PREFIX_TO_SERVICE` from the web `apiConfig.js`.
   static const _prefixTable = [
-    // Auth → platform
     ['/api/v1/auth', 'AUTH'],
     ['/api/v1/me/', 'SETTINGS'],
-
-    // Payroll → payroll module
     ['/api/v1/payroll-runs', 'PAYROLL'],
     ['/api/v1/salary-structures', 'PAYROLL'],
     ['/api/v1/salary-revisions', 'PAYROLL'],
     ['/api/v1/employee-salaries', 'PAYROLL'],
     ['/api/v1/payslips', 'PAYROLL'],
     ['/api/v1/payroll', 'PAYROLL'],
-
-    // Attendance → payroll
     ['/api/v1/employee-shifts', 'ATTENDANCE'],
     ['/api/v1/shifts', 'ATTENDANCE'],
     ['/api/v1/attendance', 'ATTENDANCE'],
-
-    // Employee → core
     ['/api/v1/employees', 'EMPLOYEE'],
     ['/api/v1/deployments', 'EMPLOYEE'],
-
-    // Dashboard → core
     ['/api/v1/dashboard', 'EMPLOYEE'],
-
-    // Leave → payroll
     ['/api/v1/leave-requests', 'LEAVE'],
     ['/api/v1/leave-balances', 'LEAVE'],
     ['/api/v1/leave-types', 'LEAVE'],
     ['/api/v1/public-holidays', 'LEAVE'],
     ['/api/v1/leave', 'LEAVE'],
-
-    // Approvals history → payroll
     ['/api/v1/approvals', 'PAYROLL'],
-
-    // Compliance → payroll
     ['/api/v1/pf-contributions', 'COMPLIANCE'],
     ['/api/v1/pf-challans', 'COMPLIANCE'],
     ['/api/v1/esic-challans', 'COMPLIANCE'],
     ['/api/v1/challans', 'COMPLIANCE'],
     ['/api/v1/compliance', 'COMPLIANCE'],
-
-    // Document → core
     ['/api/v1/document-templates', 'DOCUMENT'],
     ['/api/v1/documents', 'DOCUMENT'],
-
-    // Notification → platform
     ['/api/v1/notification-templates', 'NOTIFICATION'],
     ['/api/v1/notifications', 'NOTIFICATION'],
-
-    // Tracking → core
     ['/api/v1/geofences', 'TRACKING'],
     ['/api/v1/tracking', 'TRACKING'],
-
-    // Settings → platform
     ['/api/v1/work-locations', 'SETTINGS'],
     ['/api/v1/departments', 'SETTINGS'],
     ['/api/v1/designations', 'SETTINGS'],
@@ -118,56 +78,43 @@ class ApiClient {
     ['/api/v1/admin', 'SETTINGS'],
     ['/api/v1/jobs', 'SETTINGS'],
     ['/api/v1/settings', 'SETTINGS'],
-
-    // Report → payroll
     ['/api/v1/reports', 'REPORT'],
   ];
 
   static late Dio _dio;
 
-  /// Build the full base URL for a module.
   static String _makeModuleUrl(String module) {
     final host = _apiHost.replaceAll(RegExp(r'/+$'), '');
-    if (_apiMode == 'path') {
-      return '$host/svc/$module';
-    }
-    return '$host:${_modulePorts[module]}';
+    return _apiMode == 'path'
+        ? '$host/svc/$module'
+        : '$host:${_modulePorts[module]}';
   }
 
-  /// Build the full base URL for an old service key.
-  static String _makeServiceUrl(String serviceKey) {
-    final module = _oldToNew[serviceKey];
-    if (module == null) throw Exception('Unknown service key: $serviceKey');
+  static String _makeServiceUrl(String key) {
+    final module = _oldToNew[key];
+    if (module == null) throw Exception('Unknown service key: $key');
     return _makeModuleUrl(module);
   }
 
-  /// Resolve a request path to its module base URL (first-match-wins).
   static String? resolveServiceUrl(String? path) {
     if (path == null) return null;
-    for (final entry in _prefixTable) {
-      if (path.startsWith(entry[0])) {
-        return _makeServiceUrl(entry[1]);
-      }
+    for (final e in _prefixTable) {
+      if (path.startsWith(e[0])) return _makeServiceUrl(e[1]);
     }
     return null;
   }
 
-  /// Convenience: AUTH service URL for direct use (refresh, login).
   static String get authBaseUrl => _makeServiceUrl('AUTH');
 
   static void init() {
-    _dio = Dio(
-      BaseOptions(
-        // baseURL is intentionally NOT set — resolved per-request.
-        connectTimeout: const Duration(seconds: 30),
-        receiveTimeout: const Duration(seconds: 30),
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-      ),
-    );
-
+    _dio = Dio(BaseOptions(
+      connectTimeout: const Duration(seconds: 30),
+      receiveTimeout: const Duration(seconds: 30),
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+    ));
     _dio.interceptors.addAll([
       _ServiceRouterInterceptor(),
       _AuthInterceptor(),
@@ -177,67 +124,68 @@ class ApiClient {
 
   static Dio get instance => _dio;
 
-  /// Decode a JWT payload (the middle Base64 segment) without verification.
-  /// Returns the claims map, or empty map on failure.
+  // ── JWT Decode (mirrors web jwtUtils.js) ────────────────────────────────
   static Map<String, dynamic> decodeJwtPayload(String token) {
     try {
       final parts = token.split('.');
       if (parts.length != 3) return {};
-      // Base64 segment needs padding
-      String payload = parts[1];
-      switch (payload.length % 4) {
+      String seg = parts[1].replaceAll('-', '+').replaceAll('_', '/');
+      switch (seg.length % 4) {
         case 2:
-          payload += '==';
+          seg += '==';
           break;
         case 3:
-          payload += '=';
+          seg += '=';
           break;
       }
-      final decoded = String.fromCharCodes(
-        base64Url.decode(payload),
-      );
-      final map = jsonDecode(decoded);
-      return map is Map<String, dynamic> ? map : {};
+      return jsonDecode(utf8.decode(base64Decode(seg))) as Map<String, dynamic>;
     } catch (_) {
       return {};
     }
   }
 
-  /// Extract tenantId from JWT claims.
   static String? getTenantIdFromToken(String? token) {
     if (token == null) return null;
-    final claims = decodeJwtPayload(token);
-    return claims['tenantId']?.toString();
+    final p = decodeJwtPayload(token);
+    return (p['tenantId'] ?? p['tenant_id'])?.toString();
   }
 
-  /// Extract branchId from JWT claims.
   static String? getBranchIdFromToken(String? token) {
     if (token == null) return null;
-    final claims = decodeJwtPayload(token);
-    return (claims['activeBranchId'] ?? claims['branchId'])?.toString();
+    final p = decodeJwtPayload(token);
+    return (p['activeBranchId'] ?? p['branchId'] ?? p['branch_id'])?.toString();
+  }
+
+  static List<String> getRolesFromToken(String? token) {
+    if (token == null) return [];
+    final p = decodeJwtPayload(token);
+    if (p['roles'] is List)
+      return (p['roles'] as List).map((e) => e.toString()).toList();
+    if (p['role'] is String) return [p['role']];
+    return [];
+  }
+
+  static int? getEmployeeIdFromToken(String? token) {
+    if (token == null) return null;
+    final p = decodeJwtPayload(token);
+    final v = p['employeeId'] ?? p['employee_id'];
+    return v is int ? v : (v != null ? int.tryParse(v.toString()) : null);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SERVICE ROUTER — resolves baseURL per-request from the prefix table
-// ═══════════════════════════════════════════════════════════════════════════════
 class _ServiceRouterInterceptor extends Interceptor {
   @override
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
-    final serviceBase = ApiClient.resolveServiceUrl(options.path);
-    if (serviceBase != null) {
-      options.baseUrl = serviceBase;
-    }
+    final base = ApiClient.resolveServiceUrl(options.path);
+    if (base != null) options.baseUrl = base;
     handler.next(options);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AUTH INTERCEPTOR — attaches JWT + X-Tenant-ID, handles 401 refresh
-// ═══════════════════════════════════════════════════════════════════════════════
 class _AuthInterceptor extends Interceptor {
   static const _storage = FlutterSecureStorage();
-
   static const _publicPaths = [
     '/api/v1/auth/login',
     '/api/v1/auth/refresh',
@@ -245,7 +193,6 @@ class _AuthInterceptor extends Interceptor {
     '/api/v1/auth/reset-password',
     '/api/v1/auth/validate-reset-token',
   ];
-
   static bool _isPublic(String? url) =>
       url != null && _publicPaths.any((p) => url.contains(p));
 
@@ -255,107 +202,60 @@ class _AuthInterceptor extends Interceptor {
 
   @override
   void onRequest(
-    RequestOptions options,
-    RequestInterceptorHandler handler,
-  ) async {
+      RequestOptions options, RequestInterceptorHandler handler) async {
     final token = await _storage.read(key: 'auth_token');
-    final storedTenantId = await _storage.read(key: 'tenant_id');
-    final storedBranchId = await _storage.read(key: 'branch_id');
-
     if (token != null && !_isPublic(options.path)) {
       options.headers['Authorization'] = 'Bearer $token';
-
-      // Prefer stored tenantId; fall back to decoding the JWT (same as web frontend).
-      final tenantId = storedTenantId ?? ApiClient.getTenantIdFromToken(token);
+      // Prefer stored; fall back to JWT decode (same as web interceptor)
+      final tenantId = await _storage.read(key: 'tenant_id') ??
+          ApiClient.getTenantIdFromToken(token);
       options.headers['X-Tenant-ID'] = tenantId ?? '0';
-
-      final branchId = storedBranchId ?? ApiClient.getBranchIdFromToken(token);
-      if (branchId != null) {
-        options.headers['X-Branch-ID'] = branchId;
-      }
+      final branchId = await _storage.read(key: 'branch_id') ??
+          ApiClient.getBranchIdFromToken(token);
+      if (branchId != null) options.headers['X-Branch-ID'] = branchId;
     }
-
-    // Let browser/Dio set Content-Type for FormData (multipart)
-    if (options.data is FormData) {
-      options.headers.remove('Content-Type');
-    }
-
+    if (options.data is FormData) options.headers.remove('Content-Type');
     handler.next(options);
   }
 
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) async {
-    if (err.response?.statusCode != 401) {
+    if (err.response?.statusCode != 401 || _isPublic(err.requestOptions.path)) {
       handler.next(err);
       return;
     }
-
-    final originalRequest = err.requestOptions;
-
-    // Don't try to refresh if the refresh call itself failed
-    if (_isPublic(originalRequest.path)) {
-      handler.next(err);
-      return;
-    }
-
     if (_isRefreshing) {
-      _failedQueue.add((options: originalRequest, handler: handler));
+      _failedQueue.add((options: err.requestOptions, handler: handler));
       return;
     }
-
     _isRefreshing = true;
-
     try {
       final refreshDio = Dio(BaseOptions(
-        baseUrl: ApiClient.authBaseUrl,
-        connectTimeout: const Duration(seconds: 15),
-        receiveTimeout: const Duration(seconds: 15),
-      ));
-
-      final refreshToken = await _storage.read(key: 'refresh_token');
-      final res = await refreshDio.post(
-        '/api/v1/auth/refresh',
-        data: {},
-        options: Options(headers: {
-          if (refreshToken != null) 'Cookie': 'refreshToken=$refreshToken',
-        }),
-      );
-
+          baseUrl: ApiClient.authBaseUrl,
+          connectTimeout: const Duration(seconds: 15)));
+      final res = await refreshDio.post('/api/v1/auth/refresh', data: {});
       final newToken = res.data?['data']?['accessToken'] as String?;
-      if (newToken == null)
-        throw Exception('No accessToken in refresh response');
-
+      if (newToken == null) throw Exception('No accessToken');
       await _storage.write(key: 'auth_token', value: newToken);
-
-      // Retry the original request
-      originalRequest.headers['Authorization'] = 'Bearer $newToken';
-      final serviceBase = ApiClient.resolveServiceUrl(originalRequest.path);
-      if (serviceBase != null) originalRequest.baseUrl = serviceBase;
-
-      final response = await Dio().fetch(originalRequest);
-      handler.resolve(response);
-
-      // Retry queued requests
-      for (final queued in _failedQueue) {
-        queued.options.headers['Authorization'] = 'Bearer $newToken';
-        final qServiceBase = ApiClient.resolveServiceUrl(queued.options.path);
-        if (qServiceBase != null) queued.options.baseUrl = qServiceBase;
+      // Retry original
+      err.requestOptions.headers['Authorization'] = 'Bearer $newToken';
+      final base = ApiClient.resolveServiceUrl(err.requestOptions.path);
+      if (base != null) err.requestOptions.baseUrl = base;
+      handler.resolve(await Dio().fetch(err.requestOptions));
+      for (final q in _failedQueue) {
+        q.options.headers['Authorization'] = 'Bearer $newToken';
+        final qBase = ApiClient.resolveServiceUrl(q.options.path);
+        if (qBase != null) q.options.baseUrl = qBase;
         try {
-          final r = await Dio().fetch(queued.options);
-          queued.handler.resolve(r);
+          q.handler.resolve(await Dio().fetch(q.options));
         } catch (e) {
-          queued.handler.reject(
-            DioException(requestOptions: queued.options, error: e),
-          );
+          q.handler.reject(DioException(requestOptions: q.options, error: e));
         }
       }
     } catch (_) {
-      // Refresh failed — clear auth, reject all
       await _storage.deleteAll();
       handler.next(err);
-      for (final queued in _failedQueue) {
-        queued.handler.next(err);
-      }
+      for (final q in _failedQueue) q.handler.next(err);
     } finally {
       _isRefreshing = false;
       _failedQueue.clear();
@@ -364,34 +264,29 @@ class _AuthInterceptor extends Interceptor {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// LOGGING INTERCEPTOR
-// ═══════════════════════════════════════════════════════════════════════════════
 class _LoggingInterceptor extends Interceptor {
   final Logger _logger;
   _LoggingInterceptor(this._logger);
-
   @override
-  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
-    _logger.d('→ ${options.method} ${options.baseUrl}${options.path}');
-    handler.next(options);
+  void onRequest(RequestOptions o, RequestInterceptorHandler h) {
+    _logger.d('→ ${o.method} ${o.baseUrl}${o.path}');
+    h.next(o);
   }
 
   @override
-  void onResponse(Response response, ResponseInterceptorHandler handler) {
-    _logger.d(
-        '← ${response.statusCode} ${response.requestOptions.baseUrl}${response.requestOptions.path}');
-    handler.next(response);
+  void onResponse(Response r, ResponseInterceptorHandler h) {
+    _logger.d('← ${r.statusCode} ${r.requestOptions.path}');
+    h.next(r);
   }
 
   @override
-  void onError(DioException err, ErrorInterceptorHandler handler) {
-    _logger.e(
-        '✕ ${err.response?.statusCode} ${err.requestOptions.baseUrl}${err.requestOptions.path}: ${err.message}');
-    handler.next(err);
+  void onError(DioException e, ErrorInterceptorHandler h) {
+    _logger.e('✕ ${e.response?.statusCode} ${e.requestOptions.path}');
+    h.next(e);
   }
 }
 
-// ── API Response wrapper ──────────────────────────────────────────────────────
+// ── Shared models ─────────────────────────────────────────────────────────────
 class ApiResponse<T> {
   final T? data;
   final String? message;
@@ -399,58 +294,35 @@ class ApiResponse<T> {
   final int? totalRecords;
   final int? page;
   final int? totalPages;
-
-  ApiResponse({
-    this.data,
-    this.message,
-    this.success = true,
-    this.totalRecords,
-    this.page,
-    this.totalPages,
-  });
-
+  ApiResponse(
+      {this.data,
+      this.message,
+      this.success = true,
+      this.totalRecords,
+      this.page,
+      this.totalPages});
   factory ApiResponse.fromJson(
-    Map<String, dynamic> json,
-    T Function(dynamic) fromJson,
-  ) {
-    return ApiResponse<T>(
-      data: json['data'] != null ? fromJson(json['data']) : null,
-      message: json['message'],
-      success: json['success'] ?? true,
-      totalRecords: json['totalRecords'],
-      page: json['page'],
-      totalPages: json['totalPages'],
-    );
-  }
+          Map<String, dynamic> json, T Function(dynamic) fromJson) =>
+      ApiResponse<T>(
+        data: json['data'] != null ? fromJson(json['data']) : null,
+        message: json['message'],
+        success: json['success'] ?? true,
+        totalRecords: json['totalRecords'],
+        page: json['page'],
+        totalPages: json['totalPages'],
+      );
 }
 
-// ── API Failure model ────────────────────────────────────────────────────────
 class ApiFailure {
   final String message;
   final int? statusCode;
-  final Map<String, dynamic>? fieldErrors;
-
-  const ApiFailure({
-    required this.message,
-    this.statusCode,
-    this.fieldErrors,
-  });
-
+  const ApiFailure({required this.message, this.statusCode});
   factory ApiFailure.fromDioException(DioException e) {
-    final data = e.response?.data;
+    final d = e.response?.data;
     return ApiFailure(
-      message: (data is Map ? data['message'] : null) ??
-          e.message ??
-          'Something went wrong',
-      statusCode: e.response?.statusCode,
-      fieldErrors: data is Map ? data['errors'] : null,
-    );
+        message: (d is Map ? d['message'] : null) ??
+            e.message ??
+            'Something went wrong',
+        statusCode: e.response?.statusCode);
   }
-
-  static const ApiFailure network = ApiFailure(
-    message: 'No internet connection. Check your network and try again.',
-  );
-  static const ApiFailure timeout = ApiFailure(
-    message: 'Request timed out. Please try again.',
-  );
 }

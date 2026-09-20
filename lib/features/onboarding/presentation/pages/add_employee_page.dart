@@ -899,7 +899,8 @@ class _PickerSheet extends StatelessWidget {
         borderRadius: BorderRadius.only(
             topLeft: Radius.circular(24), topRight: Radius.circular(24)),
       ),
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
+      child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
         Container(
             width: 36,
             height: 4,
@@ -913,8 +914,8 @@ class _PickerSheet extends StatelessWidget {
         const SizedBox(height: 10),
         _tile(context, Icons.photo_library_rounded, 'Gallery',
             ImageSource.gallery),
-        const SizedBox(height: 4),
-      ]),
+        const SizedBox(height: 24),
+      ])),
     );
   }
 
