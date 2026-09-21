@@ -23,7 +23,9 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
   Map<String, dynamic> _data = {};
   List<dynamic> _family = [], _emergency = [], _bank = [], _documents = [];
   String? _photoPath;
-  final _expanded = <int>{0}; // first section expanded by default
+  final _expanded = <int>{0};
+  final _scrollCtrl = ScrollController();
+  final _sectionKeys = List.generate(6, (_) => GlobalKey());
 
   // Controllers
   late final TextEditingController _firstNameCtrl,
@@ -66,11 +68,14 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
     _pfCtrl = TextEditingController();
     _esicCtrl = TextEditingController();
     _dobCtrl = TextEditingController();
+    _scrollCtrl.addListener(_onScroll);
     _fetchAll();
   }
 
   @override
   void dispose() {
+    _scrollCtrl.removeListener(_onScroll);
+    _scrollCtrl.dispose();
     for (final c in [
       _firstNameCtrl,
       _lastNameCtrl,
@@ -92,6 +97,33 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
       _dobCtrl
     ]) c.dispose();
     super.dispose();
+  }
+
+  /// Auto-expand the section closest to the top of the visible area.
+  void _onScroll() {
+    if (!mounted) return;
+    int? closest;
+    double closestDist = double.infinity;
+    for (int i = 0; i < _sectionKeys.length; i++) {
+      final ctx = _sectionKeys[i].currentContext;
+      if (ctx == null) continue;
+      final box = ctx.findRenderObject() as RenderBox?;
+      if (box == null || !box.hasSize) continue;
+      // Position relative to screen top
+      final screenY = box.localToGlobal(Offset.zero).dy;
+      // We want the section whose top is closest to ~180px from screen top
+      final dist = (screenY - 180).abs();
+      if (screenY > -box.size.height && dist < closestDist) {
+        closestDist = dist;
+        closest = i;
+      }
+    }
+    if (closest != null && !_expanded.contains(closest)) {
+      setState(() {
+        _expanded.clear();
+        _expanded.add(closest!);
+      });
+    }
   }
 
   ThemeController get t => ThemeController.to;
@@ -315,6 +347,7 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
         ],
       ),
       body: SingleChildScrollView(
+          controller: _scrollCtrl,
           padding: const EdgeInsets.all(16),
           child: Column(children: [
             // ── Header card with photo ──
@@ -532,6 +565,7 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
       List<Widget> children) {
     final isOpen = _expanded.contains(index);
     return AnimatedContainer(
+        key: _sectionKeys[index],
         duration: const Duration(milliseconds: 200),
         decoration: BoxDecoration(
             color: t.surface,
