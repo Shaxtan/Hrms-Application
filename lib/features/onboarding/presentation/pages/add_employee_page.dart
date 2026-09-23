@@ -9,6 +9,7 @@ import '../../../../core/constants/employment_requirements.dart';
 import '../../../../core/network/api_client.dart';
 import '../../../../shared/widgets/shared_widgets.dart';
 import '../../data/employee_api.dart';
+import '../../domain/employee_models.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONTROLLER — real API: multi-step create + side-steps
@@ -44,6 +45,18 @@ class AddEmployeeController extends GetxController {
   final _api = EmployeeApi();
 
   // Text controllers
+  // ── Job Details dropdowns (API-driven) ────────────────────────────────────
+  final clients = <ClientCompany>[].obs;
+  final branches = <Branch>[].obs;
+  final departments = <Department>[].obs;
+  final designations = <Designation>[].obs;
+  final loadingDropdowns = false.obs;
+  final loadingBranchDepts = false.obs;
+  final selectedClientId = Rxn<int>();
+  final selectedBranchId = Rxn<int>();
+  final selectedDepartmentId = Rxn<int>();
+  final selectedDesignationId = Rxn<int>();
+
   final aadhaarController = TextEditingController();
   final fullNameController = TextEditingController();
   final fatherHusbandNameController = TextEditingController();
@@ -82,6 +95,32 @@ class AddEmployeeController extends GetxController {
     ever(maritalStatusValue, (_) => recomputeMissing());
     ever(bankNameValue, (_) => recomputeMissing());
     ever(aadhaarConsentGiven, (_) => recomputeMissing());
+
+    // ── Job Details reactive wiring ────────────────────────────────────────
+    _loadDropdowns();
+    ever<int?>(selectedClientId, (id) {
+      // Client changed → clear dependent selections
+      selectedBranchId.value = null;
+      selectedDepartmentId.value = null;
+      departments.clear();
+      clientController.text = _lookupClientName(id);
+      recomputeMissing();
+    });
+    ever<int?>(selectedBranchId, (id) {
+      selectedDepartmentId.value = null;
+      departments.clear();
+      branchController.text = _lookupBranchName(id);
+      if (id != null) _loadEffectiveDepartments(id);
+      recomputeMissing();
+    });
+    ever<int?>(selectedDepartmentId, (id) {
+      departmentController.text = _lookupDepartmentName(id);
+      recomputeMissing();
+    });
+    ever<int?>(selectedDesignationId, (id) {
+      designationController.text = _lookupDesignationName(id);
+      recomputeMissing();
+    });
 
     permanentAddressController.addListener(() {
       if (!_currentAddressTouched) {
@@ -141,6 +180,84 @@ class AddEmployeeController extends GetxController {
     }
   }
 
+  // ── Dropdown loaders ──────────────────────────────────────────────────────
+  Future<void> _loadDropdowns() async {
+    loadingDropdowns.value = true;
+    try {
+      final results = await Future.wait([
+        _api.getClientCompanies(),
+        _api.getBranches(),
+        _api.getDesignations(),
+      ]);
+      clients.assignAll(results[0] as List<ClientCompany>);
+      branches.assignAll(results[1] as List<Branch>);
+      designations.assignAll(results[2] as List<Designation>);
+    } catch (_) {
+      // Non-fatal — dropdowns just stay empty and user gets an empty menu
+    } finally {
+      loadingDropdowns.value = false;
+    }
+  }
+
+  Future<void> _loadEffectiveDepartments(int branchId) async {
+    loadingBranchDepts.value = true;
+    try {
+      departments.assignAll(await _api.getEffectiveDepartments(branchId));
+    } catch (_) {
+      departments.clear();
+    } finally {
+      loadingBranchDepts.value = false;
+    }
+  }
+
+  // Filter branches by the selected client company
+  List<Branch> get filteredBranches {
+    final cid = selectedClientId.value;
+    if (cid == null) return const [];
+    return branches.where((b) => b.clientCompanyId == cid).toList();
+  }
+
+  // Global designations + those scoped to selected client
+  List<Designation> get filteredDesignations {
+    final cid = selectedClientId.value;
+    return designations
+        .where((d) => d.clientCompanyId == null || d.clientCompanyId == cid)
+        .toList();
+  }
+
+  // ── Lookup helpers (avoid package:collection dependency) ──────────────────
+  String _lookupClientName(int? id) {
+    if (id == null) return '';
+    for (final c in clients) {
+      if (c.id == id) return c.clientName;
+    }
+    return '';
+  }
+
+  String _lookupBranchName(int? id) {
+    if (id == null) return '';
+    for (final b in branches) {
+      if (b.id == id) return b.branchName;
+    }
+    return '';
+  }
+
+  String _lookupDepartmentName(int? id) {
+    if (id == null) return '';
+    for (final d in departments) {
+      if (d.id == id) return d.departmentName;
+    }
+    return '';
+  }
+
+  String _lookupDesignationName(int? id) {
+    if (id == null) return '';
+    for (final d in designations) {
+      if (d.id == id) return d.designationName;
+    }
+    return '';
+  }
+
   void markCurrentAddressTouched() => _currentAddressTouched = true;
   void markConfirmationTouched() => _confirmationTouched = true;
 
@@ -167,7 +284,7 @@ class AddEmployeeController extends GetxController {
 
   void recomputeMissing() {
     final type = employmentType.value;
-    final hasClient = clientController.text.trim().isNotEmpty;
+    final hasClient = selectedClientId.value != null;
 
     final vals = <String, String>{
       'aadhaarNumber': aadhaarController.text,
@@ -185,10 +302,10 @@ class AddEmployeeController extends GetxController {
       'permanentAddress': permanentAddressController.text,
       'currentAddress': currentAddressController.text,
       'joiningDate': joiningDateController.text,
-      'clientCompanyId': clientController.text,
-      'branchId': branchController.text,
-      'departmentId': departmentController.text,
-      'designationId': designationController.text,
+      'clientCompanyId': selectedClientId.value?.toString() ?? '',
+      'branchId': selectedBranchId.value?.toString() ?? '',
+      'departmentId': selectedDepartmentId.value?.toString() ?? '',
+      'designationId': selectedDesignationId.value?.toString() ?? '',
       'bankName': bankNameValue.value,
       'bankAccountNumber': bankAccountController.text,
       'ifscCode': ifscController.text,
@@ -296,9 +413,16 @@ class AddEmployeeController extends GetxController {
         'confirmationDate': confirmationDateController.text.trim().isNotEmpty
             ? confirmationDateController.text.trim()
             : null,
-        'designationId': designationController.text.trim().isNotEmpty
-            ? int.tryParse(designationController.text.trim())
-            : null,
+        'designationId': selectedDesignationId.value,
+        if (selectedClientId.value != null)
+          'placement': {
+            'clientCompanyId': selectedClientId.value,
+            'branchId': selectedBranchId.value,
+            'departmentId': selectedDepartmentId.value,
+            'startDate': joiningDateController.text.trim().isNotEmpty
+                ? joiningDateController.text.trim()
+                : null,
+          },
         'pan': panController.text.trim().isNotEmpty
             ? panController.text.trim()
             : null,
@@ -1189,8 +1313,7 @@ class _PersonalInfoSection extends StatelessWidget {
     return Obx(() {
       final type = ctrl.employmentType.value;
       bool req(String f) => isFieldRequired(type, f,
-          isAdmin: true,
-          hasClient: ctrl.clientController.text.trim().isNotEmpty);
+          isAdmin: true, hasClient: ctrl.selectedClientId.value != null);
 
       return Column(children: [
         AppTextField(
@@ -1383,36 +1506,126 @@ class _JobDetailsSection extends StatelessWidget {
           ),
           onChanged: (_) => ctrl.markConfirmationTouched()),
       const SizedBox(height: 12),
-      AppTextField(
+
+      // ── Client ── (API: POST /api/v1/client-companies/list) ──────────────
+      Obx(() {
+        final loading = ctrl.loadingDropdowns.value;
+        final items = ctrl.clients;
+        return AppDropdown<int>(
           label: 'Client',
-          controller: ctrl.clientController,
-          hint: 'Client / company name',
+          value: ctrl.selectedClientId.value,
           required: true,
-          helperText: 'API dropdown — type for now',
-          onChanged: (_) => ctrl.recomputeMissing()),
+          enabled: !loading && items.isNotEmpty,
+          hint: loading
+              ? 'Loading clients…'
+              : (items.isEmpty ? 'No clients available' : 'Select client'),
+          helperText: loading ? null : null,
+          items: items
+              .map((c) => DropdownMenuItem<int>(
+                    value: c.id,
+                    child: Text(
+                      c.clientCode != null && c.clientCode!.isNotEmpty
+                          ? '${c.clientName} (${c.clientCode})'
+                          : c.clientName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ))
+              .toList(),
+          onChanged: (v) => ctrl.selectedClientId.value = v,
+        );
+      }),
       const SizedBox(height: 12),
-      AppTextField(
+
+      // ── Branch / Location ── (API: GET /api/v1/branches?activeOnly=true) ─
+      Obx(() {
+        final loading = ctrl.loadingDropdowns.value;
+        final clientPicked = ctrl.selectedClientId.value != null;
+        final items = ctrl.filteredBranches;
+        return AppDropdown<int>(
           label: 'Branch / Location',
-          controller: ctrl.branchController,
-          hint: 'Branch name',
+          value: ctrl.selectedBranchId.value,
           required: true,
-          helperText: 'API dropdown — type for now',
-          onChanged: (_) => ctrl.recomputeMissing()),
+          enabled: clientPicked && !loading,
+          hint: !clientPicked
+              ? 'Select client first'
+              : (loading
+                  ? 'Loading branches…'
+                  : (items.isEmpty
+                      ? 'No branches for this client'
+                      : 'Select branch')),
+          items: items
+              .map((b) => DropdownMenuItem<int>(
+                    value: b.id,
+                    child: Text(
+                      b.branchCode != null && b.branchCode!.isNotEmpty
+                          ? '${b.branchName} (${b.branchCode})'
+                          : b.branchName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ))
+              .toList(),
+          onChanged: (v) => ctrl.selectedBranchId.value = v,
+        );
+      }),
       const SizedBox(height: 12),
-      AppTextField(
+
+      // ── Department ── (API: GET /api/v1/branches/{id}/effective-depts) ───
+      Obx(() {
+        final branchPicked = ctrl.selectedBranchId.value != null;
+        final loading = ctrl.loadingBranchDepts.value;
+        final items = ctrl.departments;
+        return AppDropdown<int>(
           label: 'Department',
-          controller: ctrl.departmentController,
-          hint: 'Department name',
-          helperText: 'API dropdown — type for now',
-          onChanged: (_) => ctrl.recomputeMissing()),
-      const SizedBox(height: 12),
-      AppTextField(
-          label: 'Designation',
-          controller: ctrl.designationController,
-          hint: 'Job title / designation',
+          value: ctrl.selectedDepartmentId.value,
           required: true,
-          helperText: 'API dropdown — type for now',
-          onChanged: (_) => ctrl.recomputeMissing()),
+          enabled: branchPicked && !loading,
+          hint: !branchPicked
+              ? 'Select branch first'
+              : (loading
+                  ? 'Loading departments…'
+                  : (items.isEmpty
+                      ? 'No departments for this branch'
+                      : 'Select department')),
+          items: items
+              .map((d) => DropdownMenuItem<int>(
+                    value: d.id,
+                    child: Text(
+                      d.departmentName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ))
+              .toList(),
+          onChanged: (v) => ctrl.selectedDepartmentId.value = v,
+        );
+      }),
+      const SizedBox(height: 12),
+
+      // ── Designation ── (API: POST /api/v1/designations/list) ─────────────
+      Obx(() {
+        final loading = ctrl.loadingDropdowns.value;
+        final items = ctrl.filteredDesignations;
+        return AppDropdown<int>(
+          label: 'Designation',
+          value: ctrl.selectedDesignationId.value,
+          required: true,
+          enabled: !loading && items.isNotEmpty,
+          hint: loading
+              ? 'Loading designations…'
+              : (items.isEmpty
+                  ? 'No designations available'
+                  : 'Select designation'),
+          items: items
+              .map((d) => DropdownMenuItem<int>(
+                    value: d.id,
+                    child: Text(
+                      d.designationName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ))
+              .toList(),
+          onChanged: (v) => ctrl.selectedDesignationId.value = v,
+        );
+      }),
     ]);
   }
 }
