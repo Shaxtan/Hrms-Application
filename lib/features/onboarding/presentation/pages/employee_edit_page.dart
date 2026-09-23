@@ -23,9 +23,7 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
   Map<String, dynamic> _data = {};
   List<dynamic> _family = [], _emergency = [], _bank = [], _documents = [];
   String? _photoPath;
-  final _expanded = <int>{0};
-  final _scrollCtrl = ScrollController();
-  final _sectionKeys = List.generate(6, (_) => GlobalKey());
+  int _selectedSection = 0;
 
   // Controllers
   late final TextEditingController _firstNameCtrl,
@@ -46,6 +44,24 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
       _esicCtrl,
       _dobCtrl;
   String? _gender, _maritalStatus, _employmentType;
+
+  static const _sections = [
+    {'title': 'Personal', 'icon': Icons.person_outline_rounded, 'color': 0xFF4F46E5},
+    {'title': 'Job', 'icon': Icons.work_outline_rounded, 'color': 0xFF16A34A},
+    {'title': 'Bank & Tax', 'icon': Icons.account_balance_outlined, 'color': 0xFFD97706},
+    {'title': 'Family', 'icon': Icons.family_restroom_rounded, 'color': 0xFF7C3AED},
+    {'title': 'Emergency', 'icon': Icons.emergency_rounded, 'color': 0xFFEF4444},
+    {'title': 'Documents', 'icon': Icons.description_outlined, 'color': 0xFF0EA5E9},
+  ];
+
+  static const _sectionFullNames = [
+    'Personal Information',
+    'Job Details',
+    'Bank & Tax Details',
+    'Family Members',
+    'Emergency Contacts',
+    'Documents',
+  ];
 
   @override
   void initState() {
@@ -68,62 +84,21 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
     _pfCtrl = TextEditingController();
     _esicCtrl = TextEditingController();
     _dobCtrl = TextEditingController();
-    _scrollCtrl.addListener(_onScroll);
     _fetchAll();
   }
 
   @override
   void dispose() {
-    _scrollCtrl.removeListener(_onScroll);
-    _scrollCtrl.dispose();
     for (final c in [
-      _firstNameCtrl,
-      _lastNameCtrl,
-      _emailCtrl,
-      _phoneCtrl,
-      _designationCtrl,
-      _departmentCtrl,
-      _branchCtrl,
-      _joiningDateCtrl,
-      _bloodGroupCtrl,
-      _fatherNameCtrl,
-      _motherNameCtrl,
-      _permanentAddrCtrl,
-      _currentAddrCtrl,
-      _panCtrl,
-      _uanCtrl,
-      _pfCtrl,
-      _esicCtrl,
-      _dobCtrl
-    ]) c.dispose();
+      _firstNameCtrl, _lastNameCtrl, _emailCtrl, _phoneCtrl,
+      _designationCtrl, _departmentCtrl, _branchCtrl, _joiningDateCtrl,
+      _bloodGroupCtrl, _fatherNameCtrl, _motherNameCtrl,
+      _permanentAddrCtrl, _currentAddrCtrl,
+      _panCtrl, _uanCtrl, _pfCtrl, _esicCtrl, _dobCtrl,
+    ]) {
+      c.dispose();
+    }
     super.dispose();
-  }
-
-  /// Auto-expand the section closest to the top of the visible area.
-  void _onScroll() {
-    if (!mounted) return;
-    int? closest;
-    double closestDist = double.infinity;
-    for (int i = 0; i < _sectionKeys.length; i++) {
-      final ctx = _sectionKeys[i].currentContext;
-      if (ctx == null) continue;
-      final box = ctx.findRenderObject() as RenderBox?;
-      if (box == null || !box.hasSize) continue;
-      // Position relative to screen top
-      final screenY = box.localToGlobal(Offset.zero).dy;
-      // We want the section whose top is closest to ~180px from screen top
-      final dist = (screenY - 180).abs();
-      if (screenY > -box.size.height && dist < closestDist) {
-        closestDist = dist;
-        closest = i;
-      }
-    }
-    if (closest != null && !_expanded.contains(closest)) {
-      setState(() {
-        _expanded.clear();
-        _expanded.add(closest!);
-      });
-    }
   }
 
   ThemeController get t => ThemeController.to;
@@ -221,13 +196,6 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
   String get _empCode => (_data['employeeCode'] ?? '').toString();
   String get _status => (_data['status'] ?? '').toString();
 
-  void _toggle(int i) => setState(() {
-        if (_expanded.contains(i))
-          _expanded.remove(i);
-        else
-          _expanded.add(i);
-      });
-
   Future<void> _save() async {
     setState(() => _saving = true);
     try {
@@ -283,49 +251,56 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading)
+    if (_loading) {
       return Scaffold(
-          backgroundColor: t.bg,
-          appBar: AppBar(backgroundColor: t.surface, elevation: 0),
-          body: const Center(child: CircularProgressIndicator()));
-    if (_error != null)
+        backgroundColor: t.bg,
+        appBar: AppBar(backgroundColor: t.surface, elevation: 0),
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
+    if (_error != null) {
       return Scaffold(
-          backgroundColor: t.bg,
-          appBar: AppBar(backgroundColor: t.surface, elevation: 0),
-          body: Center(
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
+        backgroundColor: t.bg,
+        appBar: AppBar(backgroundColor: t.surface, elevation: 0),
+        body: Center(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
             const Icon(Icons.error_outline, color: AppColors.danger, size: 48),
             const SizedBox(height: 12),
             Text(_error!,
                 style: AppTextStyles.bodySmall.copyWith(color: t.textSec)),
             const SizedBox(height: 12),
-            ElevatedButton(onPressed: _fetchAll, child: const Text('Retry'))
-          ])));
+            ElevatedButton(onPressed: _fetchAll, child: const Text('Retry')),
+          ]),
+        ),
+      );
+    }
+
+    final activeColor = Color(_sections[_selectedSection]['color'] as int);
 
     return Scaffold(
       backgroundColor: t.bg,
       appBar: AppBar(
         backgroundColor: t.surface,
+        surfaceTintColor: Colors.transparent,
         elevation: 0,
-        title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(_editing ? 'Edit Employee' : 'Employee Details',
-              style:
-                  AppTextStyles.headingMedium.copyWith(color: t.textPrimary)),
-          if (_empCode.isNotEmpty)
-            Text(_empCode,
-                style: AppTextStyles.caption
-                    .copyWith(color: t.textTert, fontFamily: 'monospace')),
-        ]),
+        titleSpacing: 0,
+        title: Padding(
+          padding: const EdgeInsets.only(left: 4),
+          child: Text(
+            _editing ? 'Edit Employee' : 'Employee Details',
+            style: AppTextStyles.headingMedium.copyWith(color: t.textPrimary),
+          ),
+        ),
         actions: [
           if (_editing) ...[
             TextButton(
-                onPressed: () => setState(() {
-                      _editing = false;
-                      _populateFields();
-                    }),
-                child: Text('Cancel',
-                    style:
-                        AppTextStyles.buttonMedium.copyWith(color: t.textSec))),
+              onPressed: () => setState(() {
+                _editing = false;
+                _populateFields();
+              }),
+              child: Text('Cancel',
+                  style: AppTextStyles.buttonMedium.copyWith(color: t.textSec)),
+            ),
             _saving
                 ? const Padding(
                     padding: EdgeInsets.all(14),
@@ -337,389 +312,557 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
                     onPressed: _save,
                     child: Text('Save',
                         style: AppTextStyles.buttonMedium
-                            .copyWith(color: AppColors.accent))),
+                            .copyWith(color: AppColors.accent)),
+                  ),
           ] else
             IconButton(
-                icon: const Icon(Icons.edit_rounded,
-                    color: AppColors.accent, size: 20),
-                onPressed: () => setState(() => _editing = true)),
-          const SizedBox(width: 8),
+              icon: const Icon(Icons.edit_rounded,
+                  color: AppColors.accent, size: 20),
+              onPressed: () => setState(() => _editing = true),
+            ),
+          const SizedBox(width: 4),
         ],
       ),
-      body: SingleChildScrollView(
-          controller: _scrollCtrl,
-          padding: const EdgeInsets.all(16),
-          child: Column(children: [
-            // ── Header card with photo ──
-            _headerCard(),
-            const SizedBox(height: 12),
+      body: Column(children: [
+        // ── Compact Header ──
+        _headerCard(),
 
-            // ── Section 0: Personal Info ──
-            _accordion(0, 'Personal Information', Icons.person_outline_rounded,
-                AppColors.accent, [
-              _fieldRow('First Name', _firstNameCtrl, required: true),
-              _fieldRow('Last Name', _lastNameCtrl),
-              _fieldRow('Date of Birth', _dobCtrl),
-              _ddRow(
-                  'Gender',
-                  _gender,
-                  ['MALE', 'FEMALE', 'OTHER', 'PREFER_NOT_TO_SAY'],
-                  (v) => setState(() => _gender = v)),
-              _fieldRow('Blood Group', _bloodGroupCtrl),
-              _ddRow(
-                  'Marital Status',
-                  _maritalStatus,
-                  ['SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED'],
-                  (v) => setState(() => _maritalStatus = v)),
-              _fieldRow('Phone', _phoneCtrl, keyboard: TextInputType.phone),
-              _fieldRow('Email', _emailCtrl,
-                  keyboard: TextInputType.emailAddress),
-              _fieldRow("Father/Husband Name", _fatherNameCtrl),
-              _fieldRow("Mother's Name", _motherNameCtrl),
-              _fieldRow('Permanent Address', _permanentAddrCtrl, maxLines: 2),
-              _fieldRow('Current Address', _currentAddrCtrl, maxLines: 2),
-            ]),
-            const SizedBox(height: 10),
-
-            // ── Section 1: Job Details ──
-            _accordion(1, 'Job Details', Icons.work_outline_rounded,
-                AppColors.success, [
-              _infoRow('Employment Type', _employmentType ?? '—'),
-              _infoRow('Status', _status),
-              _fieldRow('Designation', _designationCtrl),
-              _fieldRow('Department', _departmentCtrl),
-              _fieldRow('Branch', _branchCtrl),
-              _fieldRow('Joining Date', _joiningDateCtrl),
-              _infoRow(
-                  'Aadhaar',
-                  (_data['aadhaarLast4'] ?? _data['aadhaarNumber'] ?? '—')
-                      .toString()),
-            ]),
-            const SizedBox(height: 10),
-
-            // ── Section 2: Bank & Tax ──
-            _accordion(2, 'Bank & Tax', Icons.account_balance_outlined,
-                AppColors.warning, [
-              _fieldRow('PAN', _panCtrl),
-              _fieldRow('UAN', _uanCtrl),
-              _fieldRow('PF Account', _pfCtrl),
-              _fieldRow('ESIC', _esicCtrl),
-              if (_bank.isNotEmpty) ...[
-                const SizedBox(height: 12),
-                ..._bank.map((b) {
-                  final m = b as Map<String, dynamic>;
-                  return _bankCard(m);
-                }),
-              ] else
-                Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: Text('No bank accounts on file.',
-                        style:
-                            AppTextStyles.caption.copyWith(color: t.textTert))),
-            ]),
-            const SizedBox(height: 10),
-
-            // ── Section 3: Family Members ──
-            _accordion(
-                3,
-                'Family Members',
-                Icons.family_restroom_rounded,
-                const Color(0xFF7C3AED),
-                _family.isEmpty
-                    ? [_emptyMsg('No family members on file.')]
-                    : _family
-                        .map((f) => _familyCard(f as Map<String, dynamic>))
-                        .toList()),
-            const SizedBox(height: 10),
-
-            // ── Section 4: Emergency Contacts ──
-            _accordion(
-                4,
-                'Emergency Contacts',
-                Icons.emergency_rounded,
-                AppColors.danger,
-                _emergency.isEmpty
-                    ? [_emptyMsg('No emergency contacts on file.')]
-                    : _emergency
-                        .map((c) => _emergencyCard(c as Map<String, dynamic>))
-                        .toList()),
-            const SizedBox(height: 10),
-
-            // ── Section 5: Documents ──
-            _accordion(
-                5,
-                'Documents',
-                Icons.description_outlined,
-                AppColors.info,
-                _documents.isEmpty
-                    ? [_emptyMsg('No documents on file.')]
-                    : _documents
-                        .map((d) => _documentCard(d as Map<String, dynamic>))
-                        .toList()),
-
-            if (_editing) ...[
-              const SizedBox(height: 20),
-              SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                      onPressed: _saving ? null : _save,
-                      style: ElevatedButton.styleFrom(
-                          backgroundColor: AppColors.accent,
-                          padding: const EdgeInsets.symmetric(vertical: 14),
-                          shape: RoundedRectangleBorder(
-                              borderRadius:
-                                  BorderRadius.circular(AppRadius.md)),
-                          elevation: 0),
-                      child: _saving
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(
-                                  strokeWidth: 2, color: Colors.white))
-                          : Text('Save Changes',
-                              style: AppTextStyles.buttonLarge
-                                  .copyWith(color: Colors.white)))),
-            ],
-            const SizedBox(height: 32),
-          ])),
-    );
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // WIDGETS
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  Widget _headerCard() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-          color: t.surface,
-          borderRadius: BorderRadius.circular(AppRadius.lg),
-          border: Border.all(color: t.border),
-          boxShadow: t.cardShadow),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Container(
-            width: 64,
-            height: 64,
-            clipBehavior: Clip.antiAlias,
-            decoration: BoxDecoration(borderRadius: BorderRadius.circular(18)),
-            child: AuthImage(
-                url: _photoPath ??
-                    '/api/v1/employees/${widget.employeeId}/photo',
-                width: 64,
-                height: 64,
-                fit: BoxFit.cover,
-                errorWidget: Container(
-                    width: 64,
-                    height: 64,
-                    decoration: BoxDecoration(
-                        gradient: const LinearGradient(
-                            colors: [Color(0xFF4F46E5), Color(0xFF7C3AED)]),
-                        borderRadius: BorderRadius.circular(18)),
-                    child: Center(
-                        child: Text(_initials,
-                            style: AppTextStyles.headingLarge.copyWith(
-                                color: Colors.white, fontSize: 20)))))),
-        const SizedBox(width: 14),
+        // ── Sidebar + Content ──
         Expanded(
-            child:
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(_fullName.isNotEmpty ? _fullName : 'Employee',
-              style: AppTextStyles.headingMedium.copyWith(color: t.textPrimary),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis),
-          const SizedBox(height: 2),
-          Text(_empCode,
-              style: AppTextStyles.caption.copyWith(
-                  color: t.textTert, fontFamily: 'monospace', fontSize: 12)),
-          if (_emailCtrl.text.isNotEmpty) ...[
-            const SizedBox(height: 2),
-            Text(_emailCtrl.text,
-                style: AppTextStyles.caption
-                    .copyWith(color: t.textSec, fontSize: 11),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis)
-          ],
-          const SizedBox(height: 6),
-          Wrap(spacing: 8, runSpacing: 4, children: [
-            StatusBadge(status: _status),
-            if (_employmentType != null)
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // ── Left Sidebar ──
               Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                  decoration: BoxDecoration(
-                      color: AppColors.accentLight,
-                      borderRadius: BorderRadius.circular(AppRadius.full)),
-                  child: Text(_employmentType!,
-                      style: AppTextStyles.caption.copyWith(
-                          color: AppColors.accent,
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600))),
-          ]),
-        ])),
+                width: 76,
+                decoration: BoxDecoration(
+                  color: t.surface,
+                  border: Border(
+                    right: BorderSide(color: t.border.withOpacity(0.5)),
+                  ),
+                ),
+                child: ListView.builder(
+                  padding: const EdgeInsets.only(top: 8, bottom: 20),
+                  itemCount: _sections.length,
+                  itemBuilder: (_, i) {
+                    final sec = _sections[i];
+                    final isActive = _selectedSection == i;
+                    final color = Color(sec['color'] as int);
+                    return GestureDetector(
+                      onTap: () => setState(() => _selectedSection = i),
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        decoration: BoxDecoration(
+                          color: isActive
+                              ? color.withOpacity(0.08)
+                              : Colors.transparent,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: isActive
+                                ? color.withOpacity(0.25)
+                                : Colors.transparent,
+                          ),
+                        ),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              width: 36,
+                              height: 36,
+                              decoration: BoxDecoration(
+                                color: isActive
+                                    ? color.withOpacity(0.15)
+                                    : t.bg,
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Icon(
+                                sec['icon'] as IconData,
+                                size: 18,
+                                color: isActive ? color : t.textTert,
+                              ),
+                            ),
+                            const SizedBox(height: 5),
+                            Text(
+                              sec['title'] as String,
+                              textAlign: TextAlign.center,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 9.5,
+                                fontWeight: isActive
+                                    ? FontWeight.w700
+                                    : FontWeight.w500,
+                                color: isActive ? color : t.textTert,
+                                height: 1.1,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+
+              // ── Right Content Panel ──
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(14, 10, 14, 24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Section title bar
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: activeColor.withOpacity(0.05),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                              color: activeColor.withOpacity(0.12)),
+                        ),
+                        child: Row(children: [
+                          Icon(
+                            _sections[_selectedSection]['icon'] as IconData,
+                            color: activeColor,
+                            size: 18,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              _sectionFullNames[_selectedSection],
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w700,
+                                color: activeColor,
+                                letterSpacing: -0.2,
+                              ),
+                            ),
+                          ),
+                        ]),
+                      ),
+                      const SizedBox(height: 14),
+
+                      // Section fields
+                      ..._sectionContent(_selectedSection),
+
+                      // Save button at bottom of any section in edit mode
+                      if (_editing) ...[
+                        const SizedBox(height: 20),
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            onPressed: _saving ? null : _save,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppColors.accent,
+                              padding:
+                                  const EdgeInsets.symmetric(vertical: 14),
+                              shape: RoundedRectangleBorder(
+                                borderRadius:
+                                    BorderRadius.circular(AppRadius.md),
+                              ),
+                              elevation: 0,
+                            ),
+                            child: _saving
+                                ? const SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2, color: Colors.white))
+                                : Text('Save Changes',
+                                    style: AppTextStyles.buttonLarge
+                                        .copyWith(color: Colors.white)),
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 16),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ]),
     );
   }
 
-  Widget _accordion(int index, String title, IconData icon, Color color,
-      List<Widget> children) {
-    final isOpen = _expanded.contains(index);
-    return AnimatedContainer(
-        key: _sectionKeys[index],
-        duration: const Duration(milliseconds: 200),
-        decoration: BoxDecoration(
-            color: t.surface,
-            borderRadius: BorderRadius.circular(AppRadius.lg),
-            border:
-                Border.all(color: isOpen ? color.withOpacity(0.4) : t.border),
-            boxShadow: t.cardShadow),
-        child: Column(children: [
-          // Header
-          InkWell(
-              borderRadius: BorderRadius.circular(AppRadius.lg),
-              onTap: () => _toggle(index),
-              child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                  decoration: BoxDecoration(
-                      color:
-                          isOpen ? color.withOpacity(0.06) : Colors.transparent,
-                      borderRadius: isOpen
-                          ? const BorderRadius.only(
-                              topLeft: Radius.circular(AppRadius.lg - 1),
-                              topRight: Radius.circular(AppRadius.lg - 1))
-                          : BorderRadius.circular(AppRadius.lg - 1)),
-                  child: Row(children: [
-                    Container(
-                        padding: const EdgeInsets.all(6),
-                        decoration: BoxDecoration(
-                            color: color.withOpacity(0.1),
-                            borderRadius: BorderRadius.circular(8)),
-                        child: Icon(icon, color: color, size: 18)),
-                    const SizedBox(width: 12),
-                    Expanded(
-                        child: Text(title,
-                            style: AppTextStyles.headingSmall.copyWith(
-                                color: isOpen ? color : t.textPrimary))),
-                    AnimatedRotation(
-                        turns: isOpen ? 0.5 : 0,
-                        duration: const Duration(milliseconds: 200),
-                        child: Icon(Icons.keyboard_arrow_down_rounded,
-                            color: t.textTert, size: 22)),
-                  ]))),
-          // Body
-          AnimatedCrossFade(
-              firstChild: Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                  child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Divider(color: t.border, height: 1),
-                        const SizedBox(height: 14),
-                        ...children,
-                      ])),
-              secondChild: const SizedBox(width: double.infinity),
-              crossFadeState:
-                  isOpen ? CrossFadeState.showFirst : CrossFadeState.showSecond,
-              duration: const Duration(milliseconds: 200)),
-        ]));
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HEADER CARD — compact, inline with appbar area
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Widget _headerCard() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: t.surface,
+        border: Border(bottom: BorderSide(color: t.border.withOpacity(0.5))),
+      ),
+      child: Row(children: [
+        // Avatar
+        Container(
+          width: 52,
+          height: 52,
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(borderRadius: BorderRadius.circular(14)),
+          child: AuthImage(
+            url: _photoPath ?? '/api/v1/employees/${widget.employeeId}/photo',
+            width: 52,
+            height: 52,
+            fit: BoxFit.cover,
+            errorWidget: Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                    colors: [Color(0xFF4F46E5), Color(0xFF7C3AED)]),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Center(
+                child: Text(_initials,
+                    style: AppTextStyles.headingLarge
+                        .copyWith(color: Colors.white, fontSize: 18)),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        // Info
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Name
+              Text(
+                _fullName.isNotEmpty ? _fullName : 'Employee',
+                style: AppTextStyles.headingSmall
+                    .copyWith(color: t.textPrimary, fontSize: 15),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 2),
+              // Code + Email row
+              Row(children: [
+                Text(
+                  _empCode,
+                  style: AppTextStyles.caption.copyWith(
+                    color: t.textTert,
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                  ),
+                ),
+                if (_emailCtrl.text.isNotEmpty) ...[
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    child: Text('·',
+                        style: TextStyle(color: t.textTert, fontSize: 11)),
+                  ),
+                  Expanded(
+                    child: Text(
+                      _emailCtrl.text,
+                      style: AppTextStyles.caption
+                          .copyWith(color: t.textTert, fontSize: 11),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ]),
+              const SizedBox(height: 6),
+              // Badges — fixed height row for proper alignment
+              Row(children: [
+                _badge(_status, _statusColor(_status), _statusBgColor(_status)),
+                if (_employmentType != null) ...[
+                  const SizedBox(width: 6),
+                  _badge(
+                    _employmentType!,
+                    AppColors.accent,
+                    AppColors.accentLight,
+                  ),
+                ],
+              ]),
+            ],
+          ),
+        ),
+      ]),
+    );
   }
 
-  Widget _infoRow(String label, String value) => Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        SizedBox(
-            width: 140,
+  /// Uniform badge builder — same height, same padding, same font
+  Widget _badge(String text, Color fg, Color bg) {
+    return Container(
+      height: 22,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(11),
+      ),
+      child: Text(
+        text,
+        style: TextStyle(
+          color: fg,
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+          height: 1,
+        ),
+      ),
+    );
+  }
+
+  Color _statusColor(String s) {
+    switch (s.toUpperCase()) {
+      case 'ACTIVE':
+        return AppColors.success;
+      case 'INACTIVE':
+      case 'DEACTIVATED':
+        return AppColors.danger;
+      case 'PENDING':
+      case 'PENDING_ONBOARDING':
+        return AppColors.warning;
+      default:
+        return t.textSec;
+    }
+  }
+
+  Color _statusBgColor(String s) {
+    switch (s.toUpperCase()) {
+      case 'ACTIVE':
+        return AppColors.successLight;
+      case 'INACTIVE':
+      case 'DEACTIVATED':
+        return AppColors.dangerLight;
+      case 'PENDING':
+      case 'PENDING_ONBOARDING':
+        return AppColors.warningLight;
+      default:
+        return t.bg;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SECTION CONTENT
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  List<Widget> _sectionContent(int index) {
+    switch (index) {
+      case 0:
+        return [
+          _fieldRow('First Name', _firstNameCtrl, required: true),
+          _fieldRow('Last Name', _lastNameCtrl),
+          _fieldRow('Date of Birth', _dobCtrl),
+          _ddRow('Gender', _gender,
+              ['MALE', 'FEMALE', 'OTHER', 'PREFER_NOT_TO_SAY'],
+              (v) => setState(() => _gender = v)),
+          _fieldRow('Blood Group', _bloodGroupCtrl),
+          _ddRow('Marital Status', _maritalStatus,
+              ['SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED'],
+              (v) => setState(() => _maritalStatus = v)),
+          _fieldRow('Phone', _phoneCtrl, keyboard: TextInputType.phone),
+          _fieldRow('Email', _emailCtrl,
+              keyboard: TextInputType.emailAddress),
+          _fieldRow("Father/Husband Name", _fatherNameCtrl),
+          _fieldRow("Mother's Name", _motherNameCtrl),
+          _fieldRow('Permanent Address', _permanentAddrCtrl, maxLines: 2),
+          _fieldRow('Current Address', _currentAddrCtrl, maxLines: 2),
+        ];
+      case 1:
+        return [
+          _infoRow('Employment Type', _employmentType ?? '—'),
+          _infoRow('Status', _status),
+          _fieldRow('Designation', _designationCtrl),
+          _fieldRow('Department', _departmentCtrl),
+          _fieldRow('Branch', _branchCtrl),
+          _fieldRow('Joining Date', _joiningDateCtrl),
+          _infoRow('Aadhaar',
+              (_data['aadhaarLast4'] ?? _data['aadhaarNumber'] ?? '—')
+                  .toString()),
+        ];
+      case 2:
+        return [
+          _fieldRow('PAN', _panCtrl),
+          _fieldRow('UAN', _uanCtrl),
+          _fieldRow('PF Account', _pfCtrl),
+          _fieldRow('ESIC', _esicCtrl),
+          if (_bank.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Text('Bank Accounts',
+                  style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: t.textSec)),
+            ),
+            ..._bank.map((b) => _bankCard(b as Map<String, dynamic>)),
+          ] else
+            _emptyMsg('No bank accounts on file.'),
+        ];
+      case 3:
+        return _family.isEmpty
+            ? [_emptyMsg('No family members on file.')]
+            : _family
+                .map((f) => _familyCard(f as Map<String, dynamic>))
+                .toList();
+      case 4:
+        return _emergency.isEmpty
+            ? [_emptyMsg('No emergency contacts on file.')]
+            : _emergency
+                .map((c) => _emergencyCard(c as Map<String, dynamic>))
+                .toList();
+      case 5:
+        return _documents.isEmpty
+            ? [_emptyMsg('No documents on file.')]
+            : _documents
+                .map((d) => _documentCard(d as Map<String, dynamic>))
+                .toList();
+      default:
+        return [];
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FIELD / INFO WIDGETS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Widget _infoRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 110,
             child: Text(label,
-                style: AppTextStyles.caption
-                    .copyWith(color: t.textTert, fontSize: 12))),
-        Expanded(
-            child: Text(value.isNotEmpty ? value : '—',
-                style: AppTextStyles.bodySmall.copyWith(
-                    color: t.textPrimary, fontWeight: FontWeight.w500)))
-      ]));
+                style: TextStyle(
+                    fontSize: 12,
+                    color: t.textTert,
+                    fontWeight: FontWeight.w400)),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              value.isNotEmpty ? value : '—',
+              style: TextStyle(
+                fontSize: 13,
+                color: value.isNotEmpty ? t.textPrimary : t.textTert,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _fieldRow(String label, TextEditingController ctrl,
       {bool required = false, TextInputType? keyboard, int maxLines = 1}) {
     if (!_editing) return _infoRow(label, ctrl.text);
     return Padding(
-        padding: const EdgeInsets.only(bottom: 14),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
           Row(children: [
-            Text(label, style: AppTextStyles.label.copyWith(color: t.textSec)),
+            Text(label,
+                style: AppTextStyles.label.copyWith(color: t.textSec)),
             if (required)
               const Text(' *',
-                  style: TextStyle(color: AppColors.danger, fontSize: 12))
+                  style: TextStyle(color: AppColors.danger, fontSize: 12)),
           ]),
           const SizedBox(height: 6),
           TextField(
-              controller: ctrl,
-              keyboardType: keyboard,
-              maxLines: maxLines,
-              style: AppTextStyles.bodyMedium.copyWith(color: t.textPrimary),
-              decoration: InputDecoration(
-                  filled: true,
-                  fillColor: t.surfaceVar,
-                  border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(AppRadius.md),
-                      borderSide: BorderSide(color: t.border)),
-                  enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(AppRadius.md),
-                      borderSide: BorderSide(color: t.border)),
-                  focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(AppRadius.md),
-                      borderSide:
-                          const BorderSide(color: AppColors.accent, width: 2)),
-                  contentPadding: EdgeInsets.symmetric(
-                      horizontal: 12, vertical: maxLines > 1 ? 12 : 10)))
-        ]));
+            controller: ctrl,
+            keyboardType: keyboard,
+            maxLines: maxLines,
+            style: AppTextStyles.bodyMedium.copyWith(color: t.textPrimary),
+            decoration: InputDecoration(
+              filled: true,
+              fillColor: t.surfaceVar,
+              border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                  borderSide: BorderSide(color: t.border)),
+              enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                  borderSide: BorderSide(color: t.border)),
+              focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                  borderSide:
+                      const BorderSide(color: AppColors.accent, width: 2)),
+              contentPadding: EdgeInsets.symmetric(
+                  horizontal: 12, vertical: maxLines > 1 ? 12 : 10),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _ddRow(String label, String? value, List<String> options,
       void Function(String?) onChanged) {
     if (!_editing) return _infoRow(label, value ?? '—');
     return Padding(
-        padding: const EdgeInsets.only(bottom: 14),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
           Text(label, style: AppTextStyles.label.copyWith(color: t.textSec)),
           const SizedBox(height: 6),
           DropdownButtonFormField<String>(
-              value: value,
-              items: options
-                  .map((v) => DropdownMenuItem(value: v, child: Text(v)))
-                  .toList(),
-              onChanged: onChanged,
-              style: AppTextStyles.bodyMedium.copyWith(color: t.textPrimary),
-              dropdownColor: t.surface,
-              decoration: InputDecoration(
-                  filled: true,
-                  fillColor: t.surfaceVar,
-                  border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(AppRadius.md),
-                      borderSide: BorderSide(color: t.border)),
-                  enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(AppRadius.md),
-                      borderSide: BorderSide(color: t.border)),
-                  contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 10)))
-        ]));
+            value: value,
+            items: options
+                .map((v) => DropdownMenuItem(value: v, child: Text(v)))
+                .toList(),
+            onChanged: onChanged,
+            style: AppTextStyles.bodyMedium.copyWith(color: t.textPrimary),
+            dropdownColor: t.surface,
+            decoration: InputDecoration(
+              filled: true,
+              fillColor: t.surfaceVar,
+              border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                  borderSide: BorderSide(color: t.border)),
+              enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                  borderSide: BorderSide(color: t.border)),
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _emptyMsg(String msg) => Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child:
-          Text(msg, style: AppTextStyles.caption.copyWith(color: t.textTert)));
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Icon(Icons.inbox_outlined, color: t.textTert.withOpacity(0.4), size: 36),
+          const SizedBox(height: 6),
+          Text(msg,
+              style:
+                  AppTextStyles.caption.copyWith(color: t.textTert)),
+        ]),
+      ));
 
   Widget _meta(IconData icon, String text) => Padding(
-      padding: const EdgeInsets.only(top: 3),
+      padding: const EdgeInsets.only(top: 4),
       child: Row(children: [
         Icon(icon, size: 13, color: t.textTert),
         const SizedBox(width: 6),
         Expanded(
-            child: Text(text,
-                style: AppTextStyles.caption
-                    .copyWith(color: t.textSec, fontSize: 11)))
+          child: Text(text,
+              style: TextStyle(color: t.textSec, fontSize: 11)),
+        ),
       ]));
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CARD WIDGETS — bank, family, emergency, document
+  // ═══════════════════════════════════════════════════════════════════════════
 
   Widget _bankCard(Map<String, dynamic> m) => Container(
       margin: const EdgeInsets.only(bottom: 8),
@@ -735,16 +878,7 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
                   style: AppTextStyles.bodySmall.copyWith(
                       fontWeight: FontWeight.w600, color: t.textPrimary))),
           if (m['isPrimary'] == true)
-            Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                decoration: BoxDecoration(
-                    color: AppColors.successLight,
-                    borderRadius: BorderRadius.circular(AppRadius.full)),
-                child: Text('Primary',
-                    style: AppTextStyles.caption.copyWith(
-                        color: AppColors.success,
-                        fontSize: 10,
-                        fontWeight: FontWeight.w600)))
+            _badge('Primary', AppColors.success, AppColors.successLight),
         ]),
         const SizedBox(height: 6),
         _meta(Icons.account_balance_outlined,
@@ -767,16 +901,11 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
               child: Text(m['fullName'] ?? '',
                   style: AppTextStyles.bodySmall.copyWith(
                       fontWeight: FontWeight.w600, color: t.textPrimary))),
-          Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-              decoration: BoxDecoration(
-                  color: AppColors.accentLight,
-                  borderRadius: BorderRadius.circular(AppRadius.full)),
-              child: Text(m['relationship'] ?? '',
-                  style: AppTextStyles.caption.copyWith(
-                      color: AppColors.accent,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 10)))
+          _badge(
+            m['relationship'] ?? '',
+            AppColors.accent,
+            AppColors.accentLight,
+          ),
         ]),
         const SizedBox(height: 4),
         if (m['dateOfBirth'] != null)
