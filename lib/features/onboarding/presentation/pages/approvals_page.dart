@@ -4,6 +4,7 @@ import 'package:dio/dio.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/network/api_client.dart';
 import '../../../../shared/widgets/shared_widgets.dart';
+import '../../data/employee_api.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MODEL
@@ -126,11 +127,39 @@ class ApprovalsController extends GetxController {
   final _items = <ApprovalItem>[].obs;
 
   final Dio _dio = ApiClient.instance;
+  final EmployeeApi _api = EmployeeApi();
+
+  // ── RBAC permissions (from GET /me/bootstrap, mirrors web) ────────────────
+  // Empty until bootstrap resolves. Endpoint calls are gated by these so we
+  // never fire a request the backend will 403 (identical to the web behaviour
+  // where the tab is hidden and the fetch is never mounted).
+  final permissions = <String>{}.obs;
+  bool get canActOnboarding => _has('approval.act');
+  bool get canApproveLeave => _has('leave.approve');
+  bool get canManageAttendance => _has('attendance.manage');
+  bool get canReadApprovalHistory =>
+      canActOnboarding || canApproveLeave || canManageAttendance;
+  bool _has(String p) => permissions.contains(p);
 
   @override
   void onInit() {
     super.onInit();
     load();
+  }
+
+  /// Fetch permissions from /me/bootstrap. Best-effort: on failure we assume
+  /// no approval permissions and skip the gated endpoints — same "hide the
+  /// tab" behaviour as the web when bootstrap fails.
+  Future<void> _loadPermissions() async {
+    try {
+      final data = await _api.getBootstrap();
+      final list = (data['permissions'] as List?) ?? const [];
+      permissions
+        ..clear()
+        ..addAll(list.map((e) => e.toString()));
+    } catch (_) {
+      permissions.clear();
+    }
   }
 
   List<ApprovalItem> get filtered => _items.where((i) {
@@ -157,46 +186,69 @@ class ApprovalsController extends GetxController {
   }
 
   /// Load all approval data from real APIs.
+  ///
+  /// Approval endpoints are permission-gated by the backend (@PreAuthorize).
+  /// We first fetch /me/bootstrap for the caller's effective permissions and
+  /// only call an approval endpoint when the caller HOLDS the matching
+  /// permission — otherwise the backend returns 403. This mirrors the web
+  /// ApprovalQueuePage which hides tabs whose permission the caller lacks.
   Future<void> load() async {
     isLoading.value = true;
     errorMsg.value = '';
     final allItems = <ApprovalItem>[];
 
+    // Fetch permissions first — everything below gates on this.
+    await _loadPermissions();
+
     try {
       // 1) Pending onboarding — GET /api/v1/employees/onboarding/pending (→ core)
-      try {
-        final res = await _dio.get('/api/v1/employees/onboarding/pending');
-        final list = (res.data?['data'] as List?) ?? [];
-        allItems.addAll(list.map(
-            (e) => ApprovalItem.fromOnboardingJson(e as Map<String, dynamic>)));
-      } catch (_) {}
+      //    Requires 'approval.act'. Skipped otherwise to avoid a guaranteed 403.
+      if (canActOnboarding) {
+        try {
+          final res = await _dio.get('/api/v1/employees/onboarding/pending');
+          final list = (res.data?['data'] as List?) ?? [];
+          allItems.addAll(list.map((e) =>
+              ApprovalItem.fromOnboardingJson(e as Map<String, dynamic>)));
+        } catch (_) {}
+      }
 
       // 2) Pending leave approvals — GET /api/v1/leave-requests/pending-approvals (→ payroll)
-      try {
-        final res = await _dio.get('/api/v1/leave-requests/pending-approvals');
-        final list = (res.data?['data'] as List?) ?? [];
-        allItems.addAll(list
-            .map((e) => ApprovalItem.fromLeaveJson(e as Map<String, dynamic>)));
-      } catch (_) {}
+      //    Requires 'leave.approve'.
+      if (canApproveLeave) {
+        try {
+          final res =
+              await _dio.get('/api/v1/leave-requests/pending-approvals');
+          final list = (res.data?['data'] as List?) ?? [];
+          allItems.addAll(list.map(
+              (e) => ApprovalItem.fromLeaveJson(e as Map<String, dynamic>)));
+        } catch (_) {}
+      }
 
       // 3) Pending regularisations — GET /api/v1/attendance/regularisation/pending-approvals (→ payroll)
-      try {
-        final res = await _dio
-            .get('/api/v1/attendance/regularisation/pending-approvals');
-        final list = (res.data?['data'] as List?) ?? [];
-        allItems.addAll(list.map((e) =>
-            ApprovalItem.fromRegularisationJson(e as Map<String, dynamic>)));
-      } catch (_) {}
+      //    Requires 'attendance.manage'.
+      if (canManageAttendance) {
+        try {
+          final res = await _dio
+              .get('/api/v1/attendance/regularisation/pending-approvals');
+          final list = (res.data?['data'] as List?) ?? [];
+          allItems.addAll(list.map((e) =>
+              ApprovalItem.fromRegularisationJson(e as Map<String, dynamic>)));
+        } catch (_) {}
+      }
 
       // 4) Approval history (cross-flow) — GET /api/v1/approvals/my-history (→ payroll)
-      try {
-        final res = await _dio.get('/api/v1/approvals/my-history');
-        final list = (res.data?['data'] as List?) ?? [];
-        allItems.addAll(list.map(
-            (e) => ApprovalItem.fromHistoryJson(e as Map<String, dynamic>)));
-      } catch (_) {}
+      //    Only meaningful for callers who actually act on approvals.
+      if (canReadApprovalHistory) {
+        try {
+          final res = await _dio.get('/api/v1/approvals/my-history');
+          final list = (res.data?['data'] as List?) ?? [];
+          allItems.addAll(list.map(
+              (e) => ApprovalItem.fromHistoryJson(e as Map<String, dynamic>)));
+        } catch (_) {}
+      }
 
       // 5) My onboarding submissions — GET /api/v1/employees/my-submissions (→ core)
+      //    Personal read: available to every authenticated user, no gate needed.
       try {
         final res = await _dio.get('/api/v1/employees/my-submissions');
         final list = (res.data?['data'] as List?) ?? [];

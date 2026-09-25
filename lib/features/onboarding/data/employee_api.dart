@@ -299,4 +299,12 @@ class EmployeeApi {
   Future<void> rejectOnboarding(int id, String? reason) async {
     await _dio.post('/api/v1/employees/$id/reject', data: {'reason': reason});
   }
+
+  // ── Bootstrap (RBAC) — permissions + dataScope + menu ────────────────────
+  // GET /api/v1/me/bootstrap — mirrors the web fetchAndStoreBootstrap
+  // Returns: { permissions: [...], roles: [...], dataScope: {...}, ... }
+  Future<Map<String, dynamic>> getBootstrap() async {
+    final res = await _dio.get('/api/v1/me/bootstrap');
+    return (res.data?['data'] as Map<String, dynamic>?) ?? {};
+  }
 }
