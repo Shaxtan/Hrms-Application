@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../shared/widgets/shared_widgets.dart';
+import '../controllers/dashboard_controller.dart';
 import 'login_page.dart';
 
 class ProfilePage extends StatelessWidget {
@@ -273,13 +274,22 @@ class _IdCard extends StatelessWidget {
                 const Icon(Icons.badge_rounded,
                     color: Colors.white54, size: 16),
                 const SizedBox(width: 8),
-                const Text('SUPERVISOR-DS-2026',
-                    style: TextStyle(
-                        color: Colors.white70,
-                        fontSize: 12,
-                        fontFamily: 'monospace',
-                        letterSpacing: 1.2)),
-                const Spacer(),
+                // Real identity strip — the signed-in user's email (was a
+                // hardcoded placeholder badge before).
+                Expanded(
+                  child: Text(
+                      auth.userEmail.value.isNotEmpty
+                          ? auth.userEmail.value.toUpperCase()
+                          : 'HRMS EMPLOYEE',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 11,
+                          fontFamily: 'monospace',
+                          letterSpacing: 1.1)),
+                ),
+                const SizedBox(width: 8),
                 const Icon(Icons.verified_rounded,
                     color: Color(0xFF6EE7B7), size: 16),
               ]),
@@ -314,20 +324,33 @@ class _IdCard extends StatelessWidget {
       color: Colors.white.withOpacity(0.15));
 }
 
-// ── Stats Row ──────────────────────────────────────────────────────────────────
+// ── Stats Row — REAL workforce numbers from the dashboard summary ─────────────
+// why: this row previously showed hardcoded mock values (47 / 38 / 80.9%).
+// The DashboardController is registered by the shell's Dashboard tab, so its
+// already-fetched workforce summary is reused here; the row hides itself when
+// the data isn't loaded rather than showing fake numbers.
 class _StatsRow extends StatelessWidget {
   final ThemeController t;
   const _StatsRow({required this.t});
 
   @override
   Widget build(BuildContext context) {
-    return Row(children: [
-      _stat(t, '47', 'Total Onboarded', AppColors.accent),
-      const SizedBox(width: 10),
-      _stat(t, '38', 'Approved', AppColors.success),
-      const SizedBox(width: 10),
-      _stat(t, '80.9%', 'Approval Rate', AppColors.info),
-    ]);
+    if (!Get.isRegistered<DashboardController>()) {
+      return const SizedBox.shrink();
+    }
+    final dash = Get.find<DashboardController>();
+    return Obx(() {
+      final w = dash.workforce.value;
+      if (w == null) return const SizedBox.shrink();
+      return Row(children: [
+        _stat(t, '${w.totalEmployees}', 'Total Employees', AppColors.accent),
+        const SizedBox(width: 10),
+        _stat(t, '${w.working}', 'Working', AppColors.success),
+        const SizedBox(width: 10),
+        _stat(t, '${w.pendingOnboarding}', 'Pending Onboarding',
+            AppColors.warning),
+      ]);
+    });
   }
 
   Widget _stat(ThemeController t, String value, String label, Color color) =>

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
+import 'package:shimmer/shimmer.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../shared/widgets/shared_widgets.dart';
 import '../../../../shared/widgets/auth_image.dart';
@@ -203,7 +204,24 @@ class _EmployeeList extends StatelessWidget {
   Widget build(BuildContext context) {
     return Obx(() {
       if (ctrl.isLoading.value && ctrl.employees.isEmpty) {
-        return const Center(child: CircularProgressIndicator());
+        // Shimmer skeleton rows shaped like real cards — communicates layout
+        // while loading instead of a bare spinner.
+        return Shimmer.fromColors(
+          baseColor: t.surface,
+          highlightColor: t.surfaceVar,
+          child: ListView.separated(
+            physics: const NeverScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(16),
+            itemCount: 8,
+            separatorBuilder: (_, __) => const SizedBox(height: 10),
+            itemBuilder: (_, __) => Container(
+              height: 84,
+              decoration: BoxDecoration(
+                  color: t.surface,
+                  borderRadius: BorderRadius.circular(AppRadius.lg)),
+            ),
+          ),
+        );
       }
       if (ctrl.errorMsg.value.isNotEmpty && ctrl.employees.isEmpty) {
         return Center(

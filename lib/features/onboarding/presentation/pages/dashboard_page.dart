@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:dio/dio.dart';
 import 'package:intl/intl.dart';
+import 'package:shimmer/shimmer.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/network/api_client.dart';
 import '../../../../shared/widgets/shared_widgets.dart';
@@ -612,42 +613,91 @@ class DashboardPage extends StatelessWidget {
     final t = ThemeController.to;
     return Scaffold(
       backgroundColor: t.bg,
-      body: CustomScrollView(slivers: [
-        _DashboardSliverAppBar(),
-        SliverPadding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          sliver: SliverList(
-              delegate: SliverChildListDelegate([
-            const SizedBox(height: 16),
-            // ── Workforce Stats Cards ──────────────────────────────────────
-            Obx(() => ctrl.workforce.value != null
-                ? _WorkforceStatsGrid(ctrl: ctrl)
-                : const SizedBox.shrink()),
-            const SizedBox(height: 16),
-            // ── Secondary KPI Row ──────────────────────────────────────────
-            Obx(() => ctrl.workforce.value != null
-                ? _SecondaryKpiRow(ctrl: ctrl)
-                : const SizedBox.shrink()),
-            const SizedBox(height: 16),
-            // ── Supervisor Pipeline (if available) ─────────────────────────
-            Obx(() => ctrl.supervisorMetrics.value != null
-                ? _HeroCards(ctrl: ctrl)
-                : const SizedBox.shrink()),
-            const SizedBox(height: 16),
-            // ── Employee List ──────────────────────────────────────────────
-            _EmployeeQuickList(t: t),
-            const SizedBox(height: 16),
-            // ── Recent Onboarding ──────────────────────────────────────────
-            Obx(() => ctrl.recentOnboarding.isNotEmpty
-                ? _RecentOnboardingSection(ctrl: ctrl, t: t)
-                : const SizedBox.shrink()),
-            const SizedBox(height: 16),
-            Obx(() => ctrl.pendingApprovals.isNotEmpty
-                ? _PendingTile(ctrl: ctrl)
-                : const SizedBox.shrink()),
-            const SizedBox(height: 80),
-          ])),
-        ),
+      // Pull-to-refresh: re-fetches the dashboard summary. The other tabs
+      // (Employees, Approvals) already have this — the main screen was the
+      // only one without a way to refresh short of restarting the app.
+      body: RefreshIndicator(
+        onRefresh: ctrl.load,
+        color: AppColors.accent,
+        child: CustomScrollView(
+            physics: const AlwaysScrollableScrollPhysics(
+                parent: BouncingScrollPhysics()),
+            slivers: [
+              _DashboardSliverAppBar(),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                sliver: SliverList(
+                    delegate: SliverChildListDelegate([
+                  const SizedBox(height: 16),
+                  // ── Workforce Stats Cards (shimmer skeleton on first load) ──
+                  Obx(() {
+                    if (ctrl.workforce.value != null) {
+                      return _WorkforceStatsGrid(ctrl: ctrl);
+                    }
+                    return ctrl.loading.value
+                        ? const _DashboardSkeleton()
+                        : const SizedBox.shrink();
+                  }),
+                  const SizedBox(height: 16),
+                  // ── Secondary KPI Row ──────────────────────────────────────
+                  Obx(() => ctrl.workforce.value != null
+                      ? _SecondaryKpiRow(ctrl: ctrl)
+                      : const SizedBox.shrink()),
+                  const SizedBox(height: 16),
+                  // ── Supervisor Pipeline (if available) ─────────────────────
+                  Obx(() => ctrl.supervisorMetrics.value != null
+                      ? _HeroCards(ctrl: ctrl)
+                      : const SizedBox.shrink()),
+                  const SizedBox(height: 16),
+                  // ── Employee List ──────────────────────────────────────────
+                  _EmployeeQuickList(t: t),
+                  const SizedBox(height: 16),
+                  // ── Recent Onboarding ──────────────────────────────────────
+                  Obx(() => ctrl.recentOnboarding.isNotEmpty
+                      ? _RecentOnboardingSection(ctrl: ctrl, t: t)
+                      : const SizedBox.shrink()),
+                  const SizedBox(height: 16),
+                  Obx(() => ctrl.pendingApprovals.isNotEmpty
+                      ? _PendingTile(ctrl: ctrl)
+                      : const SizedBox.shrink()),
+                  const SizedBox(height: 80),
+                ])),
+              ),
+            ]),
+      ),
+    );
+  }
+}
+
+// ── Dashboard loading skeleton — shimmer placeholders matching the stat grid ──
+class _DashboardSkeleton extends StatelessWidget {
+  const _DashboardSkeleton();
+
+  @override
+  Widget build(BuildContext context) {
+    final t = ThemeController.to;
+    Widget box(double h, {double? w, double r = AppRadius.lg}) => Container(
+        height: h,
+        width: w,
+        decoration: BoxDecoration(
+            color: t.surface, borderRadius: BorderRadius.circular(r)));
+    return Shimmer.fromColors(
+      baseColor: t.surface,
+      highlightColor: t.surfaceVar,
+      child: Column(children: [
+        Row(children: [
+          Expanded(child: box(96)),
+          const SizedBox(width: 10),
+          Expanded(child: box(96)),
+        ]),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(child: box(96)),
+          const SizedBox(width: 10),
+          Expanded(child: box(96)),
+        ]),
+        const SizedBox(height: 16),
+        box(64),
       ]),
     );
   }
@@ -1046,57 +1096,68 @@ class _StatCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: t.surface,
-        borderRadius: BorderRadius.circular(AppRadius.lg),
-        border: Border.all(color: t.border),
-        boxShadow: t.cardShadow,
-      ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        // Top color accent bar
-        Container(
-            height: 3,
-            width: 40,
-            decoration: BoxDecoration(
-                color: borderColor,
-                borderRadius: BorderRadius.circular(AppRadius.full))),
-        const SizedBox(height: 10),
-        Row(children: [
-          Expanded(
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                Text(title,
-                    style: AppTextStyles.caption.copyWith(
-                        color: t.textSec,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w500,
-                        height: 1.3)),
-                const SizedBox(height: 4),
-                Text(value,
-                    style: AppTextStyles.numericLarge.copyWith(
-                        color: t.textPrimary,
-                        fontSize: 28,
-                        fontWeight: FontWeight.w700)),
-                if (subtitle.isNotEmpty) ...[
-                  const SizedBox(height: 2),
-                  Text(subtitle,
-                      style: AppTextStyles.caption
-                          .copyWith(color: t.textTert, fontSize: 10)),
-                ],
-              ])),
+    // Entrance animation: cards fade in and rise slightly when the data
+    // arrives — runs once per build of the grid, no controller needed.
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeOutCubic,
+      builder: (context, v, child) => Opacity(
+          opacity: v,
+          child: Transform.translate(
+              offset: Offset(0, 12 * (1 - v)), child: child)),
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: t.surface,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: t.border),
+          boxShadow: t.cardShadow,
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // Top color accent bar
           Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: color.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(AppRadius.md),
+              height: 3,
+              width: 40,
+              decoration: BoxDecoration(
+                  color: borderColor,
+                  borderRadius: BorderRadius.circular(AppRadius.full))),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  Text(title,
+                      style: AppTextStyles.caption.copyWith(
+                          color: t.textSec,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                          height: 1.3)),
+                  const SizedBox(height: 4),
+                  Text(value,
+                      style: AppTextStyles.numericLarge.copyWith(
+                          color: t.textPrimary,
+                          fontSize: 28,
+                          fontWeight: FontWeight.w700)),
+                  if (subtitle.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(subtitle,
+                        style: AppTextStyles.caption
+                            .copyWith(color: t.textTert, fontSize: 10)),
+                  ],
+                ])),
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: color.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(AppRadius.md),
+              ),
+              child: Icon(icon, color: color, size: 20),
             ),
-            child: Icon(icon, color: color, size: 20),
-          ),
+          ]),
         ]),
-      ]),
+      ),
     );
   }
 }
@@ -1372,139 +1433,6 @@ class _HeroCards extends StatelessWidget {
           borderRadius: BorderRadius.circular(AppRadius.full),
           border: Border.all(color: t.border)),
       child: Text(l, style: AppTextStyles.caption.copyWith(color: t.textSec)));
-}
-
-// ── KPI Row ────────────────────────────────────────────────────────────────────
-class _KpiRow extends StatelessWidget {
-  final DashboardController ctrl;
-  const _KpiRow({required this.ctrl});
-
-  @override
-  Widget build(BuildContext context) {
-    final w = ctrl.workforceStats.value!;
-    final pct = '${(w.benchRatio * 100).toStringAsFixed(1)}%';
-    return IntrinsicHeight(
-      child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-        Expanded(
-            child: KpiCard(
-                title: 'Working',
-                value: w.working.toString(),
-                icon: Icons.people_rounded,
-                color: AppColors.accent)),
-        const SizedBox(width: 8),
-        Expanded(
-            child: KpiCard(
-                title: 'Deployed',
-                value: w.deployed.toString(),
-                subtitle: 'Billable',
-                icon: Icons.work_rounded,
-                color: AppColors.success)),
-        const SizedBox(width: 8),
-        Expanded(
-            child: KpiCard(
-                title: 'Unassigned',
-                value: w.bench.toString(),
-                subtitle: '$pct of working',
-                icon: Icons.pause_circle_outline_rounded,
-                color: AppColors.warning)),
-      ]),
-    );
-  }
-}
-
-// ── Recent Onboarding — no outer Obx; t passed in ─────────────────────────────
-class _RecentOnboarding extends StatelessWidget {
-  final DashboardController ctrl;
-  final ThemeController t;
-  const _RecentOnboarding({required this.ctrl, required this.t});
-
-  static const _typeColors = <String, (Color, Color, String)>{
-    'CONTRACT': (AppColors.accentLight, AppColors.accent, 'Contractual'),
-    'NAPS': (AppColors.infoLight, AppColors.info, 'NAPS'),
-    'FULL_TIME': (AppColors.successLight, AppColors.success, 'Staff'),
-    'INTERN': (AppColors.warningLight, AppColors.warning, 'Intern'),
-  };
-
-  @override
-  Widget build(BuildContext context) {
-    return Obx(() {
-      if (ctrl.recentOnboarding.isEmpty) return const SizedBox.shrink();
-      return Container(
-        decoration: BoxDecoration(
-            color: t.surface,
-            borderRadius: BorderRadius.circular(AppRadius.lg),
-            border: Border.all(color: t.border),
-            boxShadow: t.cardShadow),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Padding(
-              padding: const EdgeInsets.all(16),
-              child: Row(children: [
-                Expanded(
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                      Text('My Recent Onboarding',
-                          style: AppTextStyles.headingSmall
-                              .copyWith(color: t.textPrimary)),
-                      Text('Your latest submissions',
-                          style: AppTextStyles.caption
-                              .copyWith(color: t.textTert)),
-                    ])),
-                TextButton(
-                    onPressed: () {},
-                    child: Text('View all',
-                        style: AppTextStyles.caption
-                            .copyWith(color: AppColors.accent))),
-              ])),
-          Divider(height: 1, color: t.border),
-          ...ctrl.recentOnboarding.map((row) {
-            final initials = row.name.isNotEmpty
-                ? row.name
-                    .split(' ')
-                    .take(2)
-                    .map((w) => w.isNotEmpty ? w[0] : '')
-                    .join()
-                : '?';
-            return Column(children: [
-              Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                child: Row(children: [
-                  CircleAvatar(
-                      radius: 20,
-                      backgroundColor: AppColors.accentLight,
-                      child: Text(initials.toUpperCase(),
-                          style: AppTextStyles.headingSmall.copyWith(
-                              color: AppColors.accent, fontSize: 13))),
-                  const SizedBox(width: 12),
-                  Expanded(
-                      child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                        Row(children: [
-                          Expanded(
-                              child: Text(row.name,
-                                  style: AppTextStyles.bodySmall.copyWith(
-                                      fontWeight: FontWeight.w600,
-                                      color: t.textPrimary))),
-                          StatusBadge(status: row.status),
-                        ]),
-                        const SizedBox(height: 3),
-                        Row(children: [
-                          Text('ID: ${row.employeeId}',
-                              style: AppTextStyles.caption
-                                  .copyWith(color: t.textSec, fontSize: 11)),
-                        ]),
-                      ])),
-                ]),
-              ),
-              Divider(height: 1, color: t.border),
-            ]);
-          }),
-        ]),
-      );
-    });
-  }
 }
 
 // ── Pending Tile ───────────────────────────────────────────────────────────────
@@ -2010,42 +1938,5 @@ class _WeekDay extends StatelessWidget {
       const SizedBox(height: 5),
       Text(day, style: AppTextStyles.caption.copyWith(fontSize: 10, color: fg)),
     ]);
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MY REQUESTS PLACEHOLDER
-// ═══════════════════════════════════════════════════════════════════════════════
-class _SubmissionsPage extends StatelessWidget {
-  const _SubmissionsPage();
-
-  @override
-  Widget build(BuildContext context) {
-    final t = ThemeController.to;
-    return Scaffold(
-      backgroundColor: t.bg,
-      appBar: SharedAppBar(title: 'My Requests'),
-      body: Center(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Container(
-            width: 72,
-            height: 72,
-            decoration: BoxDecoration(
-                color: AppColors.accentLight,
-                borderRadius: BorderRadius.circular(AppRadius.xl)),
-            child: const Icon(Icons.assignment_outlined,
-                color: AppColors.accent, size: 32),
-          ),
-          const SizedBox(height: 16),
-          Text('My Submissions',
-              style:
-                  AppTextStyles.headingMedium.copyWith(color: t.textPrimary)),
-          const SizedBox(height: 8),
-          Text('Hires you raised and their approval status.',
-              style: AppTextStyles.bodySmall.copyWith(color: t.textSec),
-              textAlign: TextAlign.center),
-        ]),
-      ),
-    );
   }
 }

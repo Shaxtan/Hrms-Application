@@ -106,9 +106,10 @@ class AuthController extends GetxController {
         return;
       }
 
-      // Decode JWT for authoritative claims
+      // Decode JWT for authoritative claims.
+      // why: never log the decoded claims — they contain tenant/role/identity
+      // data and end up in the browser console on web builds.
       final jwt = ApiClient.decodeJwtPayload(token);
-      debugPrint('JWT CLAIMS: $jwt');
 
       // Employee object (may be absent for PLATFORM_ADMIN)
       final emp = data['employee'] as Map<String, dynamic>? ?? {};

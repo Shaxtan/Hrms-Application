@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart' hide FormData, MultipartFile;
@@ -926,6 +927,14 @@ class _PhotoHeader extends StatelessWidget {
           onTap: () => _pick(context),
           child: Obx(() {
             final photo = ctrl.profilePicture.value;
+            final bytes = ctrl.profilePictureBytes.value;
+            // why: FileImage cannot read a picked file on Flutter Web (the
+            // path is a blob URL) — the preview silently stayed blank. The
+            // raw bytes are already captured at pick time for the upload, so
+            // render from memory; File is only a mobile fallback.
+            final ImageProvider? preview = bytes != null && bytes.isNotEmpty
+                ? MemoryImage(Uint8List.fromList(bytes))
+                : (photo != null ? FileImage(photo) as ImageProvider : null);
             return Stack(children: [
               Container(
                 width: 72,
@@ -934,12 +943,11 @@ class _PhotoHeader extends StatelessWidget {
                   color: AppColors.accentLight,
                   borderRadius: BorderRadius.circular(AppRadius.lg),
                   border: Border.all(color: AppColors.accent.withOpacity(0.3)),
-                  image: photo != null
-                      ? DecorationImage(
-                          image: FileImage(photo), fit: BoxFit.cover)
+                  image: preview != null
+                      ? DecorationImage(image: preview, fit: BoxFit.cover)
                       : null,
                 ),
-                child: photo == null
+                child: preview == null
                     ? const Icon(Icons.person_rounded,
                         color: AppColors.accent, size: 32)
                     : null,
@@ -1160,7 +1168,12 @@ class _IdentitySection extends StatelessWidget {
     }
   }
 
-  String? _fname(File? f) {
+  // Prefer the real picked filename (documentNames) — on Flutter Web the
+  // File path is a blob URL, so splitting it shows a meaningless UUID.
+  String? _fname(String key) {
+    final real = ctrl.documentNames[key];
+    if (real != null && real.isNotEmpty) return real;
+    final f = ctrl.documents[key];
     if (f == null) return null;
     final p = f.path;
     return p.contains('\\') ? p.split('\\').last : p.split('/').last;
@@ -1265,7 +1278,7 @@ class _IdentitySection extends StatelessWidget {
             label: 'Aadhaar Card (Front)',
             required: true,
             helperText: 'Front side — photo or image file',
-            fileName: _fname(ctrl.documents['AADHAAR_FRONT']),
+            fileName: _fname('AADHAAR_FRONT'),
             onPick: () => _pickDoc(context, 'AADHAAR_FRONT'),
             onClear: () => ctrl.clearDocument('AADHAAR_FRONT'),
           )),
@@ -1274,7 +1287,7 @@ class _IdentitySection extends StatelessWidget {
             label: 'Aadhaar Card (Back)',
             required: true,
             helperText: 'Back side — photo or image file',
-            fileName: _fname(ctrl.documents['AADHAAR_BACK']),
+            fileName: _fname('AADHAAR_BACK'),
             onPick: () => _pickDoc(context, 'AADHAAR_BACK'),
             onClear: () => ctrl.clearDocument('AADHAAR_BACK'),
           )),
@@ -1754,7 +1767,12 @@ class _DocumentsSection extends StatelessWidget {
     }
   }
 
-  String? _fname(File? f) {
+  // Prefer the real picked filename (documentNames) — on Flutter Web the
+  // File path is a blob URL, so splitting it shows a meaningless UUID.
+  String? _fname(String key) {
+    final real = ctrl.documentNames[key];
+    if (real != null && real.isNotEmpty) return real;
+    final f = ctrl.documents[key];
     if (f == null) return null;
     final p = f.path;
     return p.contains('\\') ? p.split('\\').last : p.split('/').last;
@@ -1799,7 +1817,7 @@ class _DocumentsSection extends StatelessWidget {
                 label: slot.$2,
                 helperText: slot.$3,
                 required: required,
-                fileName: _fname(ctrl.documents[slot.$1]),
+                fileName: _fname(slot.$1),
                 onPick: () => _pick(context, slot.$1),
                 onClear: () => ctrl.clearDocument(slot.$1),
               ),
