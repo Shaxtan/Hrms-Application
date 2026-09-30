@@ -623,6 +623,9 @@ class AddEmployeeController extends GetxController {
   void _showSuccess() {
     Get.bottomSheet(
       isDismissible: false,
+      // isScrollControlled lets the sheet grow past the default ~half-screen
+      // so its own scroll view can manage height instead of overflowing.
+      isScrollControlled: true,
       _SuccessSheet(
         name: fullNameController.text.trim(),
         employeeCode: createdEmployee.value?['employeeCode'] ?? '',
@@ -1844,91 +1847,95 @@ class _SuccessSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final anyFailed = stepResults.values.any((s) => s['status'] == 'FAILED');
+    // Cap the sheet to 85% of the screen and let its whole body scroll, so a
+    // tall result list (or a short window) can never overflow. Bottom padding
+    // clears the device gesture / navigation bar.
+    final maxHeight = MediaQuery.of(context).size.height * 0.85;
+    final bottomSafe = MediaQuery.of(context).viewPadding.bottom;
     return Container(
-      padding: const EdgeInsets.fromLTRB(24, 16, 24, 40),
+      constraints: BoxConstraints(maxHeight: maxHeight),
+      padding: EdgeInsets.fromLTRB(24, 16, 24, 24 + bottomSafe),
       decoration: const BoxDecoration(
         color: AppColors.surface,
         borderRadius: BorderRadius.only(
             topLeft: Radius.circular(24), topRight: Radius.circular(24)),
       ),
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Container(
-            width: 36,
-            height: 4,
-            decoration: BoxDecoration(
-                color: AppColors.border,
-                borderRadius: BorderRadius.circular(100))),
-        const SizedBox(height: 24),
-        Container(
-          width: 64,
-          height: 64,
-          decoration: BoxDecoration(
-              color:
-                  anyFailed ? AppColors.warningLight : AppColors.successLight,
-              borderRadius: BorderRadius.circular(32)),
-          child: Icon(
-              anyFailed ? Icons.warning_amber_rounded : Icons.check_rounded,
-              color: anyFailed ? AppColors.warning : AppColors.success,
-              size: 36),
-        ),
-        const SizedBox(height: 16),
-        Text(anyFailed ? 'Created with warnings' : 'Employee Created!',
-            style: AppTextStyles.headingLarge),
-        const SizedBox(height: 6),
-        Text(name.isEmpty ? 'New Employee' : name,
-            style: AppTextStyles.bodyLarge
-                .copyWith(color: AppColors.textSecondary)),
-        if (employeeCode.isNotEmpty) ...[
-          const SizedBox(height: 4),
-          Text('Code: $employeeCode',
-              style: AppTextStyles.bodyMedium.copyWith(
-                  color: AppColors.accent,
-                  fontWeight: FontWeight.w600,
-                  fontFamily: 'monospace')),
-        ],
-        if (tempPassword != null && tempPassword!.isNotEmpty) ...[
-          const SizedBox(height: 8),
+      child: SingleChildScrollView(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
           Container(
-            padding: const EdgeInsets.all(12),
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                  color: AppColors.border,
+                  borderRadius: BorderRadius.circular(100))),
+          const SizedBox(height: 24),
+          Container(
+            width: 64,
+            height: 64,
             decoration: BoxDecoration(
-                color: AppColors.infoLight,
-                borderRadius: BorderRadius.circular(AppRadius.md),
-                border: Border.all(color: AppColors.info.withOpacity(0.3))),
-            child: Row(children: [
-              const Icon(Icons.key_rounded, color: AppColors.info, size: 18),
-              const SizedBox(width: 8),
-              Expanded(
-                  child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                    Text('Temporary Password',
-                        style: AppTextStyles.caption
-                            .copyWith(color: AppColors.info)),
-                    Text(tempPassword!,
-                        style: AppTextStyles.bodyMedium.copyWith(
-                            fontWeight: FontWeight.w700,
-                            fontFamily: 'monospace',
-                            color: AppColors.textPrimary)),
-                  ])),
-              IconButton(
-                  icon: const Icon(Icons.copy_rounded,
-                      size: 18, color: AppColors.info),
-                  onPressed: () {
-                    Clipboard.setData(ClipboardData(text: tempPassword!));
-                    Get.snackbar('Copied', 'Password copied to clipboard',
-                        snackPosition: SnackPosition.BOTTOM,
-                        margin: const EdgeInsets.all(16));
-                  }),
-            ]),
+                color:
+                    anyFailed ? AppColors.warningLight : AppColors.successLight,
+                borderRadius: BorderRadius.circular(32)),
+            child: Icon(
+                anyFailed ? Icons.warning_amber_rounded : Icons.check_rounded,
+                color: anyFailed ? AppColors.warning : AppColors.success,
+                size: 36),
           ),
-        ],
-        // Step results
-        if (stepResults.isNotEmpty) ...[
           const SizedBox(height: 16),
-          Container(
-            constraints: const BoxConstraints(maxHeight: 200),
-            child: SingleChildScrollView(
-                child: Column(
+          Text(anyFailed ? 'Created with warnings' : 'Employee Created!',
+              style: AppTextStyles.headingLarge),
+          const SizedBox(height: 6),
+          Text(name.isEmpty ? 'New Employee' : name,
+              style: AppTextStyles.bodyLarge
+                  .copyWith(color: AppColors.textSecondary)),
+          if (employeeCode.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text('Code: $employeeCode',
+                style: AppTextStyles.bodyMedium.copyWith(
+                    color: AppColors.accent,
+                    fontWeight: FontWeight.w600,
+                    fontFamily: 'monospace')),
+          ],
+          if (tempPassword != null && tempPassword!.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                  color: AppColors.infoLight,
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                  border: Border.all(color: AppColors.info.withOpacity(0.3))),
+              child: Row(children: [
+                const Icon(Icons.key_rounded, color: AppColors.info, size: 18),
+                const SizedBox(width: 8),
+                Expanded(
+                    child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                      Text('Temporary Password',
+                          style: AppTextStyles.caption
+                              .copyWith(color: AppColors.info)),
+                      Text(tempPassword!,
+                          style: AppTextStyles.bodyMedium.copyWith(
+                              fontWeight: FontWeight.w700,
+                              fontFamily: 'monospace',
+                              color: AppColors.textPrimary)),
+                    ])),
+                IconButton(
+                    icon: const Icon(Icons.copy_rounded,
+                        size: 18, color: AppColors.info),
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(text: tempPassword!));
+                      Get.snackbar('Copied', 'Password copied to clipboard',
+                          snackPosition: SnackPosition.BOTTOM,
+                          margin: const EdgeInsets.all(16));
+                    }),
+              ]),
+            ),
+          ],
+          // Step results — the whole sheet scrolls, so no inner height cap.
+          if (stepResults.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Column(
               children: stepResults.entries.map((e) {
                 final s = e.value;
                 final isOk = s['status'] == 'SUCCESS';
@@ -1957,28 +1964,29 @@ class _SuccessSheet extends StatelessWidget {
                                       : AppColors.textSecondary))),
                     ]));
               }).toList(),
-            )),
-          ),
-        ],
-        const SizedBox(height: 28),
-        SizedBox(
-          width: double.infinity,
-          child: ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.accent,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(AppRadius.md)),
-              padding: const EdgeInsets.symmetric(vertical: 14),
             ),
-            onPressed: () {
-              Get.back();
-              Get.back();
-            },
-            child: Text('Done',
-                style: AppTextStyles.buttonLarge.copyWith(color: Colors.white)),
+          ],
+          const SizedBox(height: 28),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.accent,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.md)),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: () {
+                Get.back();
+                Get.back();
+              },
+              child: Text('Done',
+                  style:
+                      AppTextStyles.buttonLarge.copyWith(color: Colors.white)),
+            ),
           ),
-        ),
-      ]),
+        ]),
+      ),
     );
   }
 }
@@ -2062,6 +2070,32 @@ class _FamilyMembersSection extends StatelessWidget {
     final isDependent = false.obs;
     final isEmergency = false.obs;
 
+    // Relationship → gender auto-mapping. Gendered relationships pick the
+    // gender for the user; SPOUSE/OTHER stay manual.
+    const maleRels = {'FATHER', 'SON', 'BROTHER'};
+    const femaleRels = {'MOTHER', 'DAUGHTER', 'SISTER'};
+
+    // Native date picker for DOB (no more manual YYYY-MM-DD typing).
+    Future<void> pickDob() async {
+      final now = DateTime.now();
+      final picked = await showDatePicker(
+        context: context,
+        initialDate: DateTime(now.year - 25),
+        firstDate: DateTime(1920),
+        lastDate: now,
+        builder: (ctx, child) => Theme(
+          data: ThemeData(
+              colorScheme: const ColorScheme.light(primary: AppColors.accent)),
+          child: child!,
+        ),
+      );
+      if (picked != null) {
+        dobCtrl.text = '${picked.year}-'
+            '${picked.month.toString().padLeft(2, '0')}-'
+            '${picked.day.toString().padLeft(2, '0')}';
+      }
+    }
+
     Get.bottomSheet(
       isScrollControlled: true,
       Container(
@@ -2100,7 +2134,15 @@ class _FamilyMembersSection extends StatelessWidget {
                 ]
                     .map((v) => DropdownMenuItem(value: v, child: Text(v)))
                     .toList(),
-                onChanged: (v) => relationship.value = v ?? '',
+                onChanged: (v) {
+                  relationship.value = v ?? '';
+                  // Auto-select gender for gendered relationships.
+                  if (maleRels.contains(v)) {
+                    gender.value = 'MALE';
+                  } else if (femaleRels.contains(v)) {
+                    gender.value = 'FEMALE';
+                  }
+                },
               )),
           const SizedBox(height: 12),
           TextField(
@@ -2108,12 +2150,17 @@ class _FamilyMembersSection extends StatelessWidget {
               decoration: const InputDecoration(
                   labelText: 'Full Name *', border: OutlineInputBorder())),
           const SizedBox(height: 12),
+          // Read-only + calendar picker — DOB is no longer typed by hand.
           TextField(
               controller: dobCtrl,
-              decoration: const InputDecoration(
-                  labelText: 'Date of Birth (YYYY-MM-DD)',
-                  border: OutlineInputBorder()),
-              keyboardType: TextInputType.datetime),
+              readOnly: true,
+              onTap: pickDob,
+              decoration: InputDecoration(
+                  labelText: 'Date of Birth *',
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                      icon: const Icon(Icons.calendar_today_rounded, size: 18),
+                      onPressed: pickDob))),
           const SizedBox(height: 12),
           Obx(() => DropdownButtonFormField<String>(
                 value: gender.value.isEmpty ? null : gender.value,
@@ -2128,8 +2175,12 @@ class _FamilyMembersSection extends StatelessWidget {
           TextField(
               controller: phoneCtrl,
               decoration: const InputDecoration(
-                  labelText: 'Phone', border: OutlineInputBorder()),
-              keyboardType: TextInputType.phone),
+                  labelText: 'Phone *', border: OutlineInputBorder()),
+              keyboardType: TextInputType.phone,
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(10),
+              ]),
           const SizedBox(height: 12),
           TextField(
               controller: emailCtrl,
@@ -2140,9 +2191,10 @@ class _FamilyMembersSection extends StatelessWidget {
           TextField(
               controller: aadhaarCtrl,
               decoration: const InputDecoration(
-                  labelText: 'Aadhaar Number', border: OutlineInputBorder()),
+                  labelText: 'Aadhaar Number *', border: OutlineInputBorder()),
               keyboardType: TextInputType.number,
-              maxLength: 12),
+              maxLength: 12,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly]),
           const SizedBox(height: 8),
           Obx(() => CheckboxListTile(
               title: const Text('Is Dependent'),
@@ -2189,9 +2241,34 @@ class _FamilyMembersSection extends StatelessWidget {
               style:
                   ElevatedButton.styleFrom(backgroundColor: AppColors.accent),
               onPressed: () {
+                final dob = dobCtrl.text.trim();
+                final phone = phoneCtrl.text.trim();
+                final aadhaar = aadhaarCtrl.text.trim();
+                // DOB, phone and Aadhaar are now mandatory (alongside name +
+                // relationship).
                 if (nameCtrl.text.trim().isEmpty ||
-                    relationship.value.isEmpty) {
-                  Get.snackbar('Missing', 'Name and relationship are required',
+                    relationship.value.isEmpty ||
+                    dob.isEmpty ||
+                    phone.isEmpty ||
+                    aadhaar.isEmpty) {
+                  Get.snackbar('Missing',
+                      'Name, relationship, date of birth, phone and Aadhaar are required',
+                      backgroundColor: AppColors.warning,
+                      colorText: Colors.white,
+                      snackPosition: SnackPosition.BOTTOM,
+                      margin: const EdgeInsets.all(16));
+                  return;
+                }
+                if (phone.length != 10) {
+                  Get.snackbar('Invalid', 'Phone must be 10 digits',
+                      backgroundColor: AppColors.warning,
+                      colorText: Colors.white,
+                      snackPosition: SnackPosition.BOTTOM,
+                      margin: const EdgeInsets.all(16));
+                  return;
+                }
+                if (aadhaar.length != 12) {
+                  Get.snackbar('Invalid', 'Aadhaar must be 12 digits',
                       backgroundColor: AppColors.warning,
                       colorText: Colors.white,
                       snackPosition: SnackPosition.BOTTOM,
@@ -2201,22 +2278,16 @@ class _FamilyMembersSection extends StatelessWidget {
                 ctrl.familyMembers.add({
                   'relationship': relationship.value,
                   'fullName': nameCtrl.text.trim(),
-                  'dateOfBirth': dobCtrl.text.trim().isNotEmpty
-                      ? dobCtrl.text.trim()
-                      : null,
+                  'dateOfBirth': dob,
                   'gender': gender.value.isNotEmpty ? gender.value : null,
                   'occupation': null,
-                  'phone': phoneCtrl.text.trim().isNotEmpty
-                      ? phoneCtrl.text.trim()
-                      : null,
+                  'phone': phone,
                   'email': emailCtrl.text.trim().isNotEmpty
                       ? emailCtrl.text.trim()
                       : null,
                   'isDependent': isDependent.value,
                   'isEmergencyContact': isEmergency.value,
-                  'aadhaarNumber': aadhaarCtrl.text.trim().isNotEmpty
-                      ? aadhaarCtrl.text.trim()
-                      : null,
+                  'aadhaarNumber': aadhaar,
                   'isNominee': isNominee.value,
                   'nomineeSharePercent': isNominee.value
                       ? (int.tryParse(shareCtrl.text.trim()) ?? 0)
