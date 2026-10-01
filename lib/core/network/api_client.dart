@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+// hide Response/FormData/MultipartFile — dio owns these types here.
+import 'package:get/get.dart' hide Response, FormData, MultipartFile;
 import 'package:logger/logger.dart';
 
 /// Mirrors the web frontend's 3-module consolidated backend topology.
@@ -253,12 +255,30 @@ class _AuthInterceptor extends Interceptor {
         }
       }
     } catch (_) {
+      // Refresh failed — session is dead. Wipe local state and force the user
+      // back to the login screen exactly like AuthController.logout() does.
+      // why: without this, a 401 leaves the user staring at a page whose data
+      //      never arrives (calls silently fail), with no clear path back.
       await _storage.deleteAll();
       handler.next(err);
       for (final q in _failedQueue) q.handler.next(err);
+      _redirectToLogin();
     } finally {
       _isRefreshing = false;
       _failedQueue.clear();
+    }
+  }
+
+  // Only redirect once, and never redirect while the user is already on /login
+  // (avoids fighting a fresh login attempt whose own 401 arrives seconds later).
+  void _redirectToLogin() {
+    try {
+      final current = Get.currentRoute;
+      if (current == '/login' || current == '/') return;
+      Get.offAllNamed('/login');
+    } catch (_) {
+      // Get isn't ready (e.g. cold-start hydration) — safe to ignore; the
+      // caller will land on /login on the next navigation attempt.
     }
   }
 }
