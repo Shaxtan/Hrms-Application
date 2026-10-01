@@ -46,12 +46,32 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
   String? _gender, _maritalStatus, _employmentType;
 
   static const _sections = [
-    {'title': 'Personal', 'icon': Icons.person_outline_rounded, 'color': 0xFF4F46E5},
+    {
+      'title': 'Personal',
+      'icon': Icons.person_outline_rounded,
+      'color': 0xFF4F46E5
+    },
     {'title': 'Job', 'icon': Icons.work_outline_rounded, 'color': 0xFF16A34A},
-    {'title': 'Bank & Tax', 'icon': Icons.account_balance_outlined, 'color': 0xFFD97706},
-    {'title': 'Family', 'icon': Icons.family_restroom_rounded, 'color': 0xFF7C3AED},
-    {'title': 'Emergency', 'icon': Icons.emergency_rounded, 'color': 0xFFEF4444},
-    {'title': 'Documents', 'icon': Icons.description_outlined, 'color': 0xFF0EA5E9},
+    {
+      'title': 'Bank & Tax',
+      'icon': Icons.account_balance_outlined,
+      'color': 0xFFD97706
+    },
+    {
+      'title': 'Family',
+      'icon': Icons.family_restroom_rounded,
+      'color': 0xFF7C3AED
+    },
+    {
+      'title': 'Emergency',
+      'icon': Icons.emergency_rounded,
+      'color': 0xFFEF4444
+    },
+    {
+      'title': 'Documents',
+      'icon': Icons.description_outlined,
+      'color': 0xFF0EA5E9
+    },
   ];
 
   static const _sectionFullNames = [
@@ -90,11 +110,24 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
   @override
   void dispose() {
     for (final c in [
-      _firstNameCtrl, _lastNameCtrl, _emailCtrl, _phoneCtrl,
-      _designationCtrl, _departmentCtrl, _branchCtrl, _joiningDateCtrl,
-      _bloodGroupCtrl, _fatherNameCtrl, _motherNameCtrl,
-      _permanentAddrCtrl, _currentAddrCtrl,
-      _panCtrl, _uanCtrl, _pfCtrl, _esicCtrl, _dobCtrl,
+      _firstNameCtrl,
+      _lastNameCtrl,
+      _emailCtrl,
+      _phoneCtrl,
+      _designationCtrl,
+      _departmentCtrl,
+      _branchCtrl,
+      _joiningDateCtrl,
+      _bloodGroupCtrl,
+      _fatherNameCtrl,
+      _motherNameCtrl,
+      _permanentAddrCtrl,
+      _currentAddrCtrl,
+      _panCtrl,
+      _uanCtrl,
+      _pfCtrl,
+      _esicCtrl,
+      _dobCtrl,
     ]) {
       c.dispose();
     }
@@ -372,9 +405,8 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
                               width: 36,
                               height: 36,
                               decoration: BoxDecoration(
-                                color: isActive
-                                    ? color.withOpacity(0.15)
-                                    : t.bg,
+                                color:
+                                    isActive ? color.withOpacity(0.15) : t.bg,
                                 borderRadius: BorderRadius.circular(10),
                               ),
                               child: Icon(
@@ -420,8 +452,8 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
                         decoration: BoxDecoration(
                           color: activeColor.withOpacity(0.05),
                           borderRadius: BorderRadius.circular(10),
-                          border: Border.all(
-                              color: activeColor.withOpacity(0.12)),
+                          border:
+                              Border.all(color: activeColor.withOpacity(0.12)),
                         ),
                         child: Row(children: [
                           Icon(
@@ -457,8 +489,7 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
                             onPressed: _saving ? null : _save,
                             style: ElevatedButton.styleFrom(
                               backgroundColor: AppColors.accent,
-                              padding:
-                                  const EdgeInsets.symmetric(vertical: 14),
+                              padding: const EdgeInsets.symmetric(vertical: 14),
                               shape: RoundedRectangleBorder(
                                 borderRadius:
                                     BorderRadius.circular(AppRadius.md),
@@ -654,16 +685,19 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
           _fieldRow('First Name', _firstNameCtrl, required: true),
           _fieldRow('Last Name', _lastNameCtrl),
           _fieldRow('Date of Birth', _dobCtrl),
-          _ddRow('Gender', _gender,
+          _ddRow(
+              'Gender',
+              _gender,
               ['MALE', 'FEMALE', 'OTHER', 'PREFER_NOT_TO_SAY'],
               (v) => setState(() => _gender = v)),
           _fieldRow('Blood Group', _bloodGroupCtrl),
-          _ddRow('Marital Status', _maritalStatus,
+          _ddRow(
+              'Marital Status',
+              _maritalStatus,
               ['SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED'],
               (v) => setState(() => _maritalStatus = v)),
           _fieldRow('Phone', _phoneCtrl, keyboard: TextInputType.phone),
-          _fieldRow('Email', _emailCtrl,
-              keyboard: TextInputType.emailAddress),
+          _fieldRow('Email', _emailCtrl, keyboard: TextInputType.emailAddress),
           _fieldRow("Father/Husband Name", _fatherNameCtrl),
           _fieldRow("Mother's Name", _motherNameCtrl),
           _fieldRow('Permanent Address', _permanentAddrCtrl, maxLines: 2),
@@ -677,7 +711,8 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
           _fieldRow('Department', _departmentCtrl),
           _fieldRow('Branch', _branchCtrl),
           _fieldRow('Joining Date', _joiningDateCtrl),
-          _infoRow('Aadhaar',
+          _infoRow(
+              'Aadhaar',
               (_data['aadhaarLast4'] ?? _data['aadhaarNumber'] ?? '—')
                   .toString()),
         ];
@@ -767,8 +802,7 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(children: [
-            Text(label,
-                style: AppTextStyles.label.copyWith(color: t.textSec)),
+            Text(label, style: AppTextStyles.label.copyWith(color: t.textSec)),
             if (required)
               const Text(' *',
                   style: TextStyle(color: AppColors.danger, fontSize: 12)),
@@ -841,11 +875,10 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
       padding: const EdgeInsets.symmetric(vertical: 12),
       child: Center(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Icon(Icons.inbox_outlined, color: t.textTert.withOpacity(0.4), size: 36),
+          Icon(Icons.inbox_outlined,
+              color: t.textTert.withOpacity(0.4), size: 36),
           const SizedBox(height: 6),
-          Text(msg,
-              style:
-                  AppTextStyles.caption.copyWith(color: t.textTert)),
+          Text(msg, style: AppTextStyles.caption.copyWith(color: t.textTert)),
         ]),
       ));
 
@@ -855,8 +888,7 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
         Icon(icon, size: 13, color: t.textTert),
         const SizedBox(width: 6),
         Expanded(
-          child: Text(text,
-              style: TextStyle(color: t.textSec, fontSize: 11)),
+          child: Text(text, style: TextStyle(color: t.textSec, fontSize: 11)),
         ),
       ]));
 
@@ -881,8 +913,11 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
             _badge('Primary', AppColors.success, AppColors.successLight),
         ]),
         const SizedBox(height: 6),
+        // The backend returns the account number MASKED by default
+        // (accountNumberMasked, e.g. "****1234"); an approver / HR reveal
+        // returns the plain accountNumber. Prefer masked → plain → dash.
         _meta(Icons.account_balance_outlined,
-            'A/c: ${m['accountNumber'] ?? '—'}'),
+            'A/c: ${m['accountNumberMasked'] ?? m['accountNumber'] ?? '—'}'),
         _meta(Icons.code_rounded, 'IFSC: ${m['ifscCode'] ?? '—'}'),
         _meta(Icons.person_outline, 'Holder: ${m['accountHolderName'] ?? '—'}'),
         _meta(Icons.credit_card_outlined, 'Type: ${m['accountType'] ?? '—'}'),

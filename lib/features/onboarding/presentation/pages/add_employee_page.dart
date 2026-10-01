@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart' hide FormData, MultipartFile;
@@ -9,6 +10,7 @@ import '../../../../core/constants/employment_requirements.dart';
 import '../../../../core/network/api_client.dart';
 import '../../../../shared/widgets/shared_widgets.dart';
 import '../../data/employee_api.dart';
+import '../../domain/employee_models.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONTROLLER — real API: multi-step create + side-steps
@@ -44,6 +46,18 @@ class AddEmployeeController extends GetxController {
   final _api = EmployeeApi();
 
   // Text controllers
+  // ── Job Details dropdowns (API-driven) ────────────────────────────────────
+  final clients = <ClientCompany>[].obs;
+  final branches = <Branch>[].obs;
+  final departments = <Department>[].obs;
+  final designations = <Designation>[].obs;
+  final loadingDropdowns = false.obs;
+  final loadingBranchDepts = false.obs;
+  final selectedClientId = Rxn<int>();
+  final selectedBranchId = Rxn<int>();
+  final selectedDepartmentId = Rxn<int>();
+  final selectedDesignationId = Rxn<int>();
+
   final aadhaarController = TextEditingController();
   final fullNameController = TextEditingController();
   final fatherHusbandNameController = TextEditingController();
@@ -82,6 +96,32 @@ class AddEmployeeController extends GetxController {
     ever(maritalStatusValue, (_) => recomputeMissing());
     ever(bankNameValue, (_) => recomputeMissing());
     ever(aadhaarConsentGiven, (_) => recomputeMissing());
+
+    // ── Job Details reactive wiring ────────────────────────────────────────
+    _loadDropdowns();
+    ever<int?>(selectedClientId, (id) {
+      // Client changed → clear dependent selections
+      selectedBranchId.value = null;
+      selectedDepartmentId.value = null;
+      departments.clear();
+      clientController.text = _lookupClientName(id);
+      recomputeMissing();
+    });
+    ever<int?>(selectedBranchId, (id) {
+      selectedDepartmentId.value = null;
+      departments.clear();
+      branchController.text = _lookupBranchName(id);
+      if (id != null) _loadEffectiveDepartments(id);
+      recomputeMissing();
+    });
+    ever<int?>(selectedDepartmentId, (id) {
+      departmentController.text = _lookupDepartmentName(id);
+      recomputeMissing();
+    });
+    ever<int?>(selectedDesignationId, (id) {
+      designationController.text = _lookupDesignationName(id);
+      recomputeMissing();
+    });
 
     permanentAddressController.addListener(() {
       if (!_currentAddressTouched) {
@@ -141,6 +181,84 @@ class AddEmployeeController extends GetxController {
     }
   }
 
+  // ── Dropdown loaders ──────────────────────────────────────────────────────
+  Future<void> _loadDropdowns() async {
+    loadingDropdowns.value = true;
+    try {
+      final results = await Future.wait([
+        _api.getClientCompanies(),
+        _api.getBranches(),
+        _api.getDesignations(),
+      ]);
+      clients.assignAll(results[0] as List<ClientCompany>);
+      branches.assignAll(results[1] as List<Branch>);
+      designations.assignAll(results[2] as List<Designation>);
+    } catch (_) {
+      // Non-fatal — dropdowns just stay empty and user gets an empty menu
+    } finally {
+      loadingDropdowns.value = false;
+    }
+  }
+
+  Future<void> _loadEffectiveDepartments(int branchId) async {
+    loadingBranchDepts.value = true;
+    try {
+      departments.assignAll(await _api.getEffectiveDepartments(branchId));
+    } catch (_) {
+      departments.clear();
+    } finally {
+      loadingBranchDepts.value = false;
+    }
+  }
+
+  // Filter branches by the selected client company
+  List<Branch> get filteredBranches {
+    final cid = selectedClientId.value;
+    if (cid == null) return const [];
+    return branches.where((b) => b.clientCompanyId == cid).toList();
+  }
+
+  // Global designations + those scoped to selected client
+  List<Designation> get filteredDesignations {
+    final cid = selectedClientId.value;
+    return designations
+        .where((d) => d.clientCompanyId == null || d.clientCompanyId == cid)
+        .toList();
+  }
+
+  // ── Lookup helpers (avoid package:collection dependency) ──────────────────
+  String _lookupClientName(int? id) {
+    if (id == null) return '';
+    for (final c in clients) {
+      if (c.id == id) return c.clientName;
+    }
+    return '';
+  }
+
+  String _lookupBranchName(int? id) {
+    if (id == null) return '';
+    for (final b in branches) {
+      if (b.id == id) return b.branchName;
+    }
+    return '';
+  }
+
+  String _lookupDepartmentName(int? id) {
+    if (id == null) return '';
+    for (final d in departments) {
+      if (d.id == id) return d.departmentName;
+    }
+    return '';
+  }
+
+  String _lookupDesignationName(int? id) {
+    if (id == null) return '';
+    for (final d in designations) {
+      if (d.id == id) return d.designationName;
+    }
+    return '';
+  }
+
   void markCurrentAddressTouched() => _currentAddressTouched = true;
   void markConfirmationTouched() => _confirmationTouched = true;
 
@@ -167,7 +285,7 @@ class AddEmployeeController extends GetxController {
 
   void recomputeMissing() {
     final type = employmentType.value;
-    final hasClient = clientController.text.trim().isNotEmpty;
+    final hasClient = selectedClientId.value != null;
 
     final vals = <String, String>{
       'aadhaarNumber': aadhaarController.text,
@@ -185,10 +303,10 @@ class AddEmployeeController extends GetxController {
       'permanentAddress': permanentAddressController.text,
       'currentAddress': currentAddressController.text,
       'joiningDate': joiningDateController.text,
-      'clientCompanyId': clientController.text,
-      'branchId': branchController.text,
-      'departmentId': departmentController.text,
-      'designationId': designationController.text,
+      'clientCompanyId': selectedClientId.value?.toString() ?? '',
+      'branchId': selectedBranchId.value?.toString() ?? '',
+      'departmentId': selectedDepartmentId.value?.toString() ?? '',
+      'designationId': selectedDesignationId.value?.toString() ?? '',
       'bankName': bankNameValue.value,
       'bankAccountNumber': bankAccountController.text,
       'ifscCode': ifscController.text,
@@ -296,9 +414,16 @@ class AddEmployeeController extends GetxController {
         'confirmationDate': confirmationDateController.text.trim().isNotEmpty
             ? confirmationDateController.text.trim()
             : null,
-        'designationId': designationController.text.trim().isNotEmpty
-            ? int.tryParse(designationController.text.trim())
-            : null,
+        'designationId': selectedDesignationId.value,
+        if (selectedClientId.value != null)
+          'placement': {
+            'clientCompanyId': selectedClientId.value,
+            'branchId': selectedBranchId.value,
+            'departmentId': selectedDepartmentId.value,
+            'startDate': joiningDateController.text.trim().isNotEmpty
+                ? joiningDateController.text.trim()
+                : null,
+          },
         'pan': panController.text.trim().isNotEmpty
             ? panController.text.trim()
             : null,
@@ -498,6 +623,9 @@ class AddEmployeeController extends GetxController {
   void _showSuccess() {
     Get.bottomSheet(
       isDismissible: false,
+      // isScrollControlled lets the sheet grow past the default ~half-screen
+      // so its own scroll view can manage height instead of overflowing.
+      isScrollControlled: true,
       _SuccessSheet(
         name: fullNameController.text.trim(),
         employeeCode: createdEmployee.value?['employeeCode'] ?? '',
@@ -802,6 +930,14 @@ class _PhotoHeader extends StatelessWidget {
           onTap: () => _pick(context),
           child: Obx(() {
             final photo = ctrl.profilePicture.value;
+            final bytes = ctrl.profilePictureBytes.value;
+            // why: FileImage cannot read a picked file on Flutter Web (the
+            // path is a blob URL) — the preview silently stayed blank. The
+            // raw bytes are already captured at pick time for the upload, so
+            // render from memory; File is only a mobile fallback.
+            final ImageProvider? preview = bytes != null && bytes.isNotEmpty
+                ? MemoryImage(Uint8List.fromList(bytes))
+                : (photo != null ? FileImage(photo) as ImageProvider : null);
             return Stack(children: [
               Container(
                 width: 72,
@@ -810,12 +946,11 @@ class _PhotoHeader extends StatelessWidget {
                   color: AppColors.accentLight,
                   borderRadius: BorderRadius.circular(AppRadius.lg),
                   border: Border.all(color: AppColors.accent.withOpacity(0.3)),
-                  image: photo != null
-                      ? DecorationImage(
-                          image: FileImage(photo), fit: BoxFit.cover)
+                  image: preview != null
+                      ? DecorationImage(image: preview, fit: BoxFit.cover)
                       : null,
                 ),
-                child: photo == null
+                child: preview == null
                     ? const Icon(Icons.person_rounded,
                         color: AppColors.accent, size: 32)
                     : null,
@@ -1036,7 +1171,12 @@ class _IdentitySection extends StatelessWidget {
     }
   }
 
-  String? _fname(File? f) {
+  // Prefer the real picked filename (documentNames) — on Flutter Web the
+  // File path is a blob URL, so splitting it shows a meaningless UUID.
+  String? _fname(String key) {
+    final real = ctrl.documentNames[key];
+    if (real != null && real.isNotEmpty) return real;
+    final f = ctrl.documents[key];
     if (f == null) return null;
     final p = f.path;
     return p.contains('\\') ? p.split('\\').last : p.split('/').last;
@@ -1141,7 +1281,7 @@ class _IdentitySection extends StatelessWidget {
             label: 'Aadhaar Card (Front)',
             required: true,
             helperText: 'Front side — photo or image file',
-            fileName: _fname(ctrl.documents['AADHAAR_FRONT']),
+            fileName: _fname('AADHAAR_FRONT'),
             onPick: () => _pickDoc(context, 'AADHAAR_FRONT'),
             onClear: () => ctrl.clearDocument('AADHAAR_FRONT'),
           )),
@@ -1150,7 +1290,7 @@ class _IdentitySection extends StatelessWidget {
             label: 'Aadhaar Card (Back)',
             required: true,
             helperText: 'Back side — photo or image file',
-            fileName: _fname(ctrl.documents['AADHAAR_BACK']),
+            fileName: _fname('AADHAAR_BACK'),
             onPick: () => _pickDoc(context, 'AADHAAR_BACK'),
             onClear: () => ctrl.clearDocument('AADHAAR_BACK'),
           )),
@@ -1189,8 +1329,7 @@ class _PersonalInfoSection extends StatelessWidget {
     return Obx(() {
       final type = ctrl.employmentType.value;
       bool req(String f) => isFieldRequired(type, f,
-          isAdmin: true,
-          hasClient: ctrl.clientController.text.trim().isNotEmpty);
+          isAdmin: true, hasClient: ctrl.selectedClientId.value != null);
 
       return Column(children: [
         AppTextField(
@@ -1383,36 +1522,126 @@ class _JobDetailsSection extends StatelessWidget {
           ),
           onChanged: (_) => ctrl.markConfirmationTouched()),
       const SizedBox(height: 12),
-      AppTextField(
+
+      // ── Client ── (API: POST /api/v1/client-companies/list) ──────────────
+      Obx(() {
+        final loading = ctrl.loadingDropdowns.value;
+        final items = ctrl.clients;
+        return AppDropdown<int>(
           label: 'Client',
-          controller: ctrl.clientController,
-          hint: 'Client / company name',
+          value: ctrl.selectedClientId.value,
           required: true,
-          helperText: 'API dropdown — type for now',
-          onChanged: (_) => ctrl.recomputeMissing()),
+          enabled: !loading && items.isNotEmpty,
+          hint: loading
+              ? 'Loading clients…'
+              : (items.isEmpty ? 'No clients available' : 'Select client'),
+          helperText: loading ? null : null,
+          items: items
+              .map((c) => DropdownMenuItem<int>(
+                    value: c.id,
+                    child: Text(
+                      c.clientCode != null && c.clientCode!.isNotEmpty
+                          ? '${c.clientName} (${c.clientCode})'
+                          : c.clientName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ))
+              .toList(),
+          onChanged: (v) => ctrl.selectedClientId.value = v,
+        );
+      }),
       const SizedBox(height: 12),
-      AppTextField(
+
+      // ── Branch / Location ── (API: GET /api/v1/branches?activeOnly=true) ─
+      Obx(() {
+        final loading = ctrl.loadingDropdowns.value;
+        final clientPicked = ctrl.selectedClientId.value != null;
+        final items = ctrl.filteredBranches;
+        return AppDropdown<int>(
           label: 'Branch / Location',
-          controller: ctrl.branchController,
-          hint: 'Branch name',
+          value: ctrl.selectedBranchId.value,
           required: true,
-          helperText: 'API dropdown — type for now',
-          onChanged: (_) => ctrl.recomputeMissing()),
+          enabled: clientPicked && !loading,
+          hint: !clientPicked
+              ? 'Select client first'
+              : (loading
+                  ? 'Loading branches…'
+                  : (items.isEmpty
+                      ? 'No branches for this client'
+                      : 'Select branch')),
+          items: items
+              .map((b) => DropdownMenuItem<int>(
+                    value: b.id,
+                    child: Text(
+                      b.branchCode != null && b.branchCode!.isNotEmpty
+                          ? '${b.branchName} (${b.branchCode})'
+                          : b.branchName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ))
+              .toList(),
+          onChanged: (v) => ctrl.selectedBranchId.value = v,
+        );
+      }),
       const SizedBox(height: 12),
-      AppTextField(
+
+      // ── Department ── (API: GET /api/v1/branches/{id}/effective-depts) ───
+      Obx(() {
+        final branchPicked = ctrl.selectedBranchId.value != null;
+        final loading = ctrl.loadingBranchDepts.value;
+        final items = ctrl.departments;
+        return AppDropdown<int>(
           label: 'Department',
-          controller: ctrl.departmentController,
-          hint: 'Department name',
-          helperText: 'API dropdown — type for now',
-          onChanged: (_) => ctrl.recomputeMissing()),
-      const SizedBox(height: 12),
-      AppTextField(
-          label: 'Designation',
-          controller: ctrl.designationController,
-          hint: 'Job title / designation',
+          value: ctrl.selectedDepartmentId.value,
           required: true,
-          helperText: 'API dropdown — type for now',
-          onChanged: (_) => ctrl.recomputeMissing()),
+          enabled: branchPicked && !loading,
+          hint: !branchPicked
+              ? 'Select branch first'
+              : (loading
+                  ? 'Loading departments…'
+                  : (items.isEmpty
+                      ? 'No departments for this branch'
+                      : 'Select department')),
+          items: items
+              .map((d) => DropdownMenuItem<int>(
+                    value: d.id,
+                    child: Text(
+                      d.departmentName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ))
+              .toList(),
+          onChanged: (v) => ctrl.selectedDepartmentId.value = v,
+        );
+      }),
+      const SizedBox(height: 12),
+
+      // ── Designation ── (API: POST /api/v1/designations/list) ─────────────
+      Obx(() {
+        final loading = ctrl.loadingDropdowns.value;
+        final items = ctrl.filteredDesignations;
+        return AppDropdown<int>(
+          label: 'Designation',
+          value: ctrl.selectedDesignationId.value,
+          required: true,
+          enabled: !loading && items.isNotEmpty,
+          hint: loading
+              ? 'Loading designations…'
+              : (items.isEmpty
+                  ? 'No designations available'
+                  : 'Select designation'),
+          items: items
+              .map((d) => DropdownMenuItem<int>(
+                    value: d.id,
+                    child: Text(
+                      d.designationName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ))
+              .toList(),
+          onChanged: (v) => ctrl.selectedDesignationId.value = v,
+        );
+      }),
     ]);
   }
 }
@@ -1541,7 +1770,12 @@ class _DocumentsSection extends StatelessWidget {
     }
   }
 
-  String? _fname(File? f) {
+  // Prefer the real picked filename (documentNames) — on Flutter Web the
+  // File path is a blob URL, so splitting it shows a meaningless UUID.
+  String? _fname(String key) {
+    final real = ctrl.documentNames[key];
+    if (real != null && real.isNotEmpty) return real;
+    final f = ctrl.documents[key];
     if (f == null) return null;
     final p = f.path;
     return p.contains('\\') ? p.split('\\').last : p.split('/').last;
@@ -1586,7 +1820,7 @@ class _DocumentsSection extends StatelessWidget {
                 label: slot.$2,
                 helperText: slot.$3,
                 required: required,
-                fileName: _fname(ctrl.documents[slot.$1]),
+                fileName: _fname(slot.$1),
                 onPick: () => _pick(context, slot.$1),
                 onClear: () => ctrl.clearDocument(slot.$1),
               ),
@@ -1613,91 +1847,95 @@ class _SuccessSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final anyFailed = stepResults.values.any((s) => s['status'] == 'FAILED');
+    // Cap the sheet to 85% of the screen and let its whole body scroll, so a
+    // tall result list (or a short window) can never overflow. Bottom padding
+    // clears the device gesture / navigation bar.
+    final maxHeight = MediaQuery.of(context).size.height * 0.85;
+    final bottomSafe = MediaQuery.of(context).viewPadding.bottom;
     return Container(
-      padding: const EdgeInsets.fromLTRB(24, 16, 24, 40),
+      constraints: BoxConstraints(maxHeight: maxHeight),
+      padding: EdgeInsets.fromLTRB(24, 16, 24, 24 + bottomSafe),
       decoration: const BoxDecoration(
         color: AppColors.surface,
         borderRadius: BorderRadius.only(
             topLeft: Radius.circular(24), topRight: Radius.circular(24)),
       ),
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Container(
-            width: 36,
-            height: 4,
-            decoration: BoxDecoration(
-                color: AppColors.border,
-                borderRadius: BorderRadius.circular(100))),
-        const SizedBox(height: 24),
-        Container(
-          width: 64,
-          height: 64,
-          decoration: BoxDecoration(
-              color:
-                  anyFailed ? AppColors.warningLight : AppColors.successLight,
-              borderRadius: BorderRadius.circular(32)),
-          child: Icon(
-              anyFailed ? Icons.warning_amber_rounded : Icons.check_rounded,
-              color: anyFailed ? AppColors.warning : AppColors.success,
-              size: 36),
-        ),
-        const SizedBox(height: 16),
-        Text(anyFailed ? 'Created with warnings' : 'Employee Created!',
-            style: AppTextStyles.headingLarge),
-        const SizedBox(height: 6),
-        Text(name.isEmpty ? 'New Employee' : name,
-            style: AppTextStyles.bodyLarge
-                .copyWith(color: AppColors.textSecondary)),
-        if (employeeCode.isNotEmpty) ...[
-          const SizedBox(height: 4),
-          Text('Code: $employeeCode',
-              style: AppTextStyles.bodyMedium.copyWith(
-                  color: AppColors.accent,
-                  fontWeight: FontWeight.w600,
-                  fontFamily: 'monospace')),
-        ],
-        if (tempPassword != null && tempPassword!.isNotEmpty) ...[
-          const SizedBox(height: 8),
+      child: SingleChildScrollView(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
           Container(
-            padding: const EdgeInsets.all(12),
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                  color: AppColors.border,
+                  borderRadius: BorderRadius.circular(100))),
+          const SizedBox(height: 24),
+          Container(
+            width: 64,
+            height: 64,
             decoration: BoxDecoration(
-                color: AppColors.infoLight,
-                borderRadius: BorderRadius.circular(AppRadius.md),
-                border: Border.all(color: AppColors.info.withOpacity(0.3))),
-            child: Row(children: [
-              const Icon(Icons.key_rounded, color: AppColors.info, size: 18),
-              const SizedBox(width: 8),
-              Expanded(
-                  child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                    Text('Temporary Password',
-                        style: AppTextStyles.caption
-                            .copyWith(color: AppColors.info)),
-                    Text(tempPassword!,
-                        style: AppTextStyles.bodyMedium.copyWith(
-                            fontWeight: FontWeight.w700,
-                            fontFamily: 'monospace',
-                            color: AppColors.textPrimary)),
-                  ])),
-              IconButton(
-                  icon: const Icon(Icons.copy_rounded,
-                      size: 18, color: AppColors.info),
-                  onPressed: () {
-                    Clipboard.setData(ClipboardData(text: tempPassword!));
-                    Get.snackbar('Copied', 'Password copied to clipboard',
-                        snackPosition: SnackPosition.BOTTOM,
-                        margin: const EdgeInsets.all(16));
-                  }),
-            ]),
+                color:
+                    anyFailed ? AppColors.warningLight : AppColors.successLight,
+                borderRadius: BorderRadius.circular(32)),
+            child: Icon(
+                anyFailed ? Icons.warning_amber_rounded : Icons.check_rounded,
+                color: anyFailed ? AppColors.warning : AppColors.success,
+                size: 36),
           ),
-        ],
-        // Step results
-        if (stepResults.isNotEmpty) ...[
           const SizedBox(height: 16),
-          Container(
-            constraints: const BoxConstraints(maxHeight: 200),
-            child: SingleChildScrollView(
-                child: Column(
+          Text(anyFailed ? 'Created with warnings' : 'Employee Created!',
+              style: AppTextStyles.headingLarge),
+          const SizedBox(height: 6),
+          Text(name.isEmpty ? 'New Employee' : name,
+              style: AppTextStyles.bodyLarge
+                  .copyWith(color: AppColors.textSecondary)),
+          if (employeeCode.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text('Code: $employeeCode',
+                style: AppTextStyles.bodyMedium.copyWith(
+                    color: AppColors.accent,
+                    fontWeight: FontWeight.w600,
+                    fontFamily: 'monospace')),
+          ],
+          if (tempPassword != null && tempPassword!.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                  color: AppColors.infoLight,
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                  border: Border.all(color: AppColors.info.withOpacity(0.3))),
+              child: Row(children: [
+                const Icon(Icons.key_rounded, color: AppColors.info, size: 18),
+                const SizedBox(width: 8),
+                Expanded(
+                    child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                      Text('Temporary Password',
+                          style: AppTextStyles.caption
+                              .copyWith(color: AppColors.info)),
+                      Text(tempPassword!,
+                          style: AppTextStyles.bodyMedium.copyWith(
+                              fontWeight: FontWeight.w700,
+                              fontFamily: 'monospace',
+                              color: AppColors.textPrimary)),
+                    ])),
+                IconButton(
+                    icon: const Icon(Icons.copy_rounded,
+                        size: 18, color: AppColors.info),
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(text: tempPassword!));
+                      Get.snackbar('Copied', 'Password copied to clipboard',
+                          snackPosition: SnackPosition.BOTTOM,
+                          margin: const EdgeInsets.all(16));
+                    }),
+              ]),
+            ),
+          ],
+          // Step results — the whole sheet scrolls, so no inner height cap.
+          if (stepResults.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Column(
               children: stepResults.entries.map((e) {
                 final s = e.value;
                 final isOk = s['status'] == 'SUCCESS';
@@ -1726,28 +1964,29 @@ class _SuccessSheet extends StatelessWidget {
                                       : AppColors.textSecondary))),
                     ]));
               }).toList(),
-            )),
-          ),
-        ],
-        const SizedBox(height: 28),
-        SizedBox(
-          width: double.infinity,
-          child: ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.accent,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(AppRadius.md)),
-              padding: const EdgeInsets.symmetric(vertical: 14),
             ),
-            onPressed: () {
-              Get.back();
-              Get.back();
-            },
-            child: Text('Done',
-                style: AppTextStyles.buttonLarge.copyWith(color: Colors.white)),
+          ],
+          const SizedBox(height: 28),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.accent,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.md)),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: () {
+                Get.back();
+                Get.back();
+              },
+              child: Text('Done',
+                  style:
+                      AppTextStyles.buttonLarge.copyWith(color: Colors.white)),
+            ),
           ),
-        ),
-      ]),
+        ]),
+      ),
     );
   }
 }
@@ -1831,6 +2070,32 @@ class _FamilyMembersSection extends StatelessWidget {
     final isDependent = false.obs;
     final isEmergency = false.obs;
 
+    // Relationship → gender auto-mapping. Gendered relationships pick the
+    // gender for the user; SPOUSE/OTHER stay manual.
+    const maleRels = {'FATHER', 'SON', 'BROTHER'};
+    const femaleRels = {'MOTHER', 'DAUGHTER', 'SISTER'};
+
+    // Native date picker for DOB (no more manual YYYY-MM-DD typing).
+    Future<void> pickDob() async {
+      final now = DateTime.now();
+      final picked = await showDatePicker(
+        context: context,
+        initialDate: DateTime(now.year - 25),
+        firstDate: DateTime(1920),
+        lastDate: now,
+        builder: (ctx, child) => Theme(
+          data: ThemeData(
+              colorScheme: const ColorScheme.light(primary: AppColors.accent)),
+          child: child!,
+        ),
+      );
+      if (picked != null) {
+        dobCtrl.text = '${picked.year}-'
+            '${picked.month.toString().padLeft(2, '0')}-'
+            '${picked.day.toString().padLeft(2, '0')}';
+      }
+    }
+
     Get.bottomSheet(
       isScrollControlled: true,
       Container(
@@ -1869,7 +2134,15 @@ class _FamilyMembersSection extends StatelessWidget {
                 ]
                     .map((v) => DropdownMenuItem(value: v, child: Text(v)))
                     .toList(),
-                onChanged: (v) => relationship.value = v ?? '',
+                onChanged: (v) {
+                  relationship.value = v ?? '';
+                  // Auto-select gender for gendered relationships.
+                  if (maleRels.contains(v)) {
+                    gender.value = 'MALE';
+                  } else if (femaleRels.contains(v)) {
+                    gender.value = 'FEMALE';
+                  }
+                },
               )),
           const SizedBox(height: 12),
           TextField(
@@ -1877,12 +2150,17 @@ class _FamilyMembersSection extends StatelessWidget {
               decoration: const InputDecoration(
                   labelText: 'Full Name *', border: OutlineInputBorder())),
           const SizedBox(height: 12),
+          // Read-only + calendar picker — DOB is no longer typed by hand.
           TextField(
               controller: dobCtrl,
-              decoration: const InputDecoration(
-                  labelText: 'Date of Birth (YYYY-MM-DD)',
-                  border: OutlineInputBorder()),
-              keyboardType: TextInputType.datetime),
+              readOnly: true,
+              onTap: pickDob,
+              decoration: InputDecoration(
+                  labelText: 'Date of Birth *',
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                      icon: const Icon(Icons.calendar_today_rounded, size: 18),
+                      onPressed: pickDob))),
           const SizedBox(height: 12),
           Obx(() => DropdownButtonFormField<String>(
                 value: gender.value.isEmpty ? null : gender.value,
@@ -1897,8 +2175,12 @@ class _FamilyMembersSection extends StatelessWidget {
           TextField(
               controller: phoneCtrl,
               decoration: const InputDecoration(
-                  labelText: 'Phone', border: OutlineInputBorder()),
-              keyboardType: TextInputType.phone),
+                  labelText: 'Phone *', border: OutlineInputBorder()),
+              keyboardType: TextInputType.phone,
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(10),
+              ]),
           const SizedBox(height: 12),
           TextField(
               controller: emailCtrl,
@@ -1909,9 +2191,10 @@ class _FamilyMembersSection extends StatelessWidget {
           TextField(
               controller: aadhaarCtrl,
               decoration: const InputDecoration(
-                  labelText: 'Aadhaar Number', border: OutlineInputBorder()),
+                  labelText: 'Aadhaar Number *', border: OutlineInputBorder()),
               keyboardType: TextInputType.number,
-              maxLength: 12),
+              maxLength: 12,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly]),
           const SizedBox(height: 8),
           Obx(() => CheckboxListTile(
               title: const Text('Is Dependent'),
@@ -1958,9 +2241,34 @@ class _FamilyMembersSection extends StatelessWidget {
               style:
                   ElevatedButton.styleFrom(backgroundColor: AppColors.accent),
               onPressed: () {
+                final dob = dobCtrl.text.trim();
+                final phone = phoneCtrl.text.trim();
+                final aadhaar = aadhaarCtrl.text.trim();
+                // DOB, phone and Aadhaar are now mandatory (alongside name +
+                // relationship).
                 if (nameCtrl.text.trim().isEmpty ||
-                    relationship.value.isEmpty) {
-                  Get.snackbar('Missing', 'Name and relationship are required',
+                    relationship.value.isEmpty ||
+                    dob.isEmpty ||
+                    phone.isEmpty ||
+                    aadhaar.isEmpty) {
+                  Get.snackbar('Missing',
+                      'Name, relationship, date of birth, phone and Aadhaar are required',
+                      backgroundColor: AppColors.warning,
+                      colorText: Colors.white,
+                      snackPosition: SnackPosition.BOTTOM,
+                      margin: const EdgeInsets.all(16));
+                  return;
+                }
+                if (phone.length != 10) {
+                  Get.snackbar('Invalid', 'Phone must be 10 digits',
+                      backgroundColor: AppColors.warning,
+                      colorText: Colors.white,
+                      snackPosition: SnackPosition.BOTTOM,
+                      margin: const EdgeInsets.all(16));
+                  return;
+                }
+                if (aadhaar.length != 12) {
+                  Get.snackbar('Invalid', 'Aadhaar must be 12 digits',
                       backgroundColor: AppColors.warning,
                       colorText: Colors.white,
                       snackPosition: SnackPosition.BOTTOM,
@@ -1970,22 +2278,16 @@ class _FamilyMembersSection extends StatelessWidget {
                 ctrl.familyMembers.add({
                   'relationship': relationship.value,
                   'fullName': nameCtrl.text.trim(),
-                  'dateOfBirth': dobCtrl.text.trim().isNotEmpty
-                      ? dobCtrl.text.trim()
-                      : null,
+                  'dateOfBirth': dob,
                   'gender': gender.value.isNotEmpty ? gender.value : null,
                   'occupation': null,
-                  'phone': phoneCtrl.text.trim().isNotEmpty
-                      ? phoneCtrl.text.trim()
-                      : null,
+                  'phone': phone,
                   'email': emailCtrl.text.trim().isNotEmpty
                       ? emailCtrl.text.trim()
                       : null,
                   'isDependent': isDependent.value,
                   'isEmergencyContact': isEmergency.value,
-                  'aadhaarNumber': aadhaarCtrl.text.trim().isNotEmpty
-                      ? aadhaarCtrl.text.trim()
-                      : null,
+                  'aadhaarNumber': aadhaar,
                   'isNominee': isNominee.value,
                   'nomineeSharePercent': isNominee.value
                       ? (int.tryParse(shareCtrl.text.trim()) ?? 0)

@@ -229,8 +229,8 @@ class EmployeeApi {
   // ── Client companies ──────────────────────────────────────────────────────
   Future<List<ClientCompany>> getClientCompanies() async {
     final res = await _dio.post(
-      '/api/v1/clients/list',
-      data: {'page': 0, 'size': 100, 'filters': {}},
+      '/api/v1/client-companies/list',
+      data: {'page': 0, 'size': 100},
     );
     final data = res.data['data'];
     final list = (data is List ? data : data['content'] as List? ?? []);
@@ -245,6 +245,15 @@ class EmployeeApi {
     );
     return ((res.data['data'] as List?) ?? [])
         .map((e) => Branch.fromJson(e))
+        .toList();
+  }
+
+  // ── Effective departments for a branch ────────────────────────────────────
+  Future<List<Department>> getEffectiveDepartments(int branchId) async {
+    final res =
+        await _dio.get('/api/v1/branches/$branchId/effective-departments');
+    return ((res.data['data'] as List?) ?? [])
+        .map((e) => Department.fromJson(e))
         .toList();
   }
 
@@ -289,5 +298,13 @@ class EmployeeApi {
 
   Future<void> rejectOnboarding(int id, String? reason) async {
     await _dio.post('/api/v1/employees/$id/reject', data: {'reason': reason});
+  }
+
+  // ── Bootstrap (RBAC) — permissions + dataScope + menu ────────────────────
+  // GET /api/v1/me/bootstrap — mirrors the web fetchAndStoreBootstrap
+  // Returns: { permissions: [...], roles: [...], dataScope: {...}, ... }
+  Future<Map<String, dynamic>> getBootstrap() async {
+    final res = await _dio.get('/api/v1/me/bootstrap');
+    return (res.data?['data'] as Map<String, dynamic>?) ?? {};
   }
 }
