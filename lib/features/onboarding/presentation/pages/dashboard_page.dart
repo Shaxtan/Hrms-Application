@@ -539,6 +539,22 @@ class _Sidebar extends StatelessWidget {
                   ),
                 ),
               ),
+              // ── Version footer ─────────────────────────────────────────
+              Container(
+                width: double.infinity,
+                color: t.surfaceVar,
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Center(
+                  child: Text(
+                    'v 1.0',
+                    style: AppTextStyles.caption.copyWith(
+                        color: t.textSec,
+                        fontSize: 11,
+                        letterSpacing: 1,
+                        fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
             ],
           ),
         ),
@@ -939,9 +955,8 @@ class _QuickEmpRow extends StatelessWidget {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UNIFIED STAT CARD
-// The single card component used throughout the dashboard for all KPI/metric
-// displays. Colour accent bar at the top, large value, label, optional subtitle,
-// icon badge at top-right. All dashboard metric sections use this or _MiniStatCard.
+// Fixed height (110) ensures all cards in a row are identical in dimension
+// regardless of title length or subtitle presence.
 // ═══════════════════════════════════════════════════════════════════════════════
 class _StatCard extends StatelessWidget {
   final String title;
@@ -963,6 +978,7 @@ class _StatCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
+      height: 110, // ← fixed height: all stat cards are the same dimension
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: t.surface,
@@ -985,6 +1001,8 @@ class _StatCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                 Text(title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                     style: AppTextStyles.caption.copyWith(
                         color: t.textSec,
                         fontSize: 11,
@@ -999,6 +1017,8 @@ class _StatCard extends StatelessWidget {
                 if (subtitle.isNotEmpty) ...[
                   const SizedBox(height: 2),
                   Text(subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: AppTextStyles.caption
                           .copyWith(color: t.textTert, fontSize: 10)),
                 ],
@@ -1020,6 +1040,8 @@ class _StatCard extends StatelessWidget {
 // ── Workforce Stats Grid ───────────────────────────────────────────────────────
 // 7 cards in a 2-column grid. The last card (Deactivated) gets a matching
 // spacer column so it aligns with cards above instead of stretching full-width.
+// crossAxisAlignment.stretch on every Row means both cards in a pair always
+// expand to match the taller sibling (enforced by the fixed height above).
 class _WorkforceStatsGrid extends StatelessWidget {
   final DashboardController ctrl;
   const _WorkforceStatsGrid({required this.ctrl});
@@ -1061,7 +1083,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
         const SizedBox(width: 10),
         Expanded(
             child: _StatCard(
-                title: 'Pending\nOnboarding',
+                title: 'Pending Onboarding',
                 value: w.pendingOnboarding.toString(),
                 subtitle: 'Awaiting approval',
                 icon: Icons.schedule_rounded,
@@ -1072,7 +1094,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
       Row(children: [
         Expanded(
             child: _StatCard(
-                title: 'Pending Salary\nSetup',
+                title: 'Pending Salary Setup',
                 value: w.pendingSalarySetup.toString(),
                 subtitle: 'Awaiting compensation',
                 icon: Icons.attach_money_rounded,
@@ -1130,7 +1152,7 @@ class _SecondaryKpiRow extends StatelessWidget {
         const SizedBox(width: 10),
         _MiniStatCard(
             value: '${w.unassignedPct.toStringAsFixed(0)}%',
-            label: 'Unassigned\nRatio',
+            label: 'Unassigned Ratio',
             icon: Icons.pie_chart_outline_rounded,
             color: AppColors.warning,
             t: t),
@@ -1144,14 +1166,14 @@ class _SecondaryKpiRow extends StatelessWidget {
         const SizedBox(width: 10),
         _MiniStatCard(
             value: '${w.newJoinersThisMonth}',
-            label: 'New Joiners\n(this mo.)',
+            label: 'New Joiners (mo.)',
             icon: Icons.person_add_outlined,
             color: AppColors.success,
             t: t),
         const SizedBox(width: 10),
         _MiniStatCard(
             value: '${w.exitsThisMonth}',
-            label: 'Exits\n(this mo.)',
+            label: 'Exits (mo.)',
             icon: Icons.exit_to_app_rounded,
             color: AppColors.danger,
             t: t),
@@ -1161,8 +1183,7 @@ class _SecondaryKpiRow extends StatelessWidget {
 }
 
 /// Compact variant of _StatCard for secondary KPI tiles.
-/// Same accent bar + card decoration as _StatCard; smaller value font (22 vs 28)
-/// so 5 tiles fit comfortably in a horizontal scroll.
+/// Fixed height (90) keeps all mini cards identical regardless of label length.
 class _MiniStatCard extends StatelessWidget {
   final String value;
   final String label;
@@ -1181,6 +1202,7 @@ class _MiniStatCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       width: 110,
+      height: 90, // ← fixed height: all mini cards are the same dimension
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: t.surface,
@@ -1214,9 +1236,10 @@ class _MiniStatCard extends StatelessWidget {
         ]),
         const SizedBox(height: 4),
         Text(label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: AppTextStyles.caption
-                .copyWith(color: t.textSec, fontSize: 10, height: 1.3),
-            maxLines: 2),
+                .copyWith(color: t.textSec, fontSize: 10, height: 1.3)),
       ]),
     );
   }

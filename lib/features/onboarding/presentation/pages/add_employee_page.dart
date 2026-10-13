@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -42,6 +43,22 @@ class AddEmployeeController extends GetxController {
   final stepResults = <String, Map<String, dynamic>>{}.obs;
   final createdEmployeeId = Rxn<int>();
   final createdEmployee = Rxn<Map<String, dynamic>>();
+
+  // ── Live availability / dedup checks (fire as the user types) ─────────────
+  // Aadhaar: IDLE | CHECKING | NONE | ACTIVE_DUPLICATE | PENDING_DUPLICATE
+  //          | REHIRE | ARCHIVED | ERROR  (mirrors the web collision cases)
+  final aadhaarCheckState = 'IDLE'.obs;
+  final aadhaarExisting = Rxn<Map<String, dynamic>>();
+  // Email / Phone: IDLE | CHECKING | AVAILABLE | TAKEN | ERROR
+  final emailCheckState = 'IDLE'.obs;
+  final phoneCheckState = 'IDLE'.obs;
+
+  Timer? _aadhaarDebounce;
+  Timer? _emailDebounce;
+  Timer? _phoneDebounce;
+  // Stale-response guards: a slow older response can't overwrite a newer one.
+  int _aadhaarSeq = 0, _emailSeq = 0, _phoneSeq = 0;
+  static final _emailRe = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$');
 
   final _api = EmployeeApi();
 
@@ -138,10 +155,95 @@ class AddEmployeeController extends GetxController {
           '${confirm.year}-${confirm.month.toString().padLeft(2, '0')}-'
           '${confirm.day.toString().padLeft(2, '0')}';
     });
+
+    // Live availability checks — fire (debounced) as the user types, so a
+    // duplicate Aadhaar / phone / email surfaces immediately instead of only
+    // at create time.
+    aadhaarController.addListener(_onAadhaarChanged);
+    emailController.addListener(_onEmailChanged);
+    phoneController.addListener(_onPhoneChanged);
+  }
+
+  // ── Live-check handlers ────────────────────────────────────────────────────
+  void _onAadhaarChanged() {
+    _aadhaarDebounce?.cancel();
+    final v = aadhaarController.text.trim();
+    if (v.length != 12) {
+      aadhaarCheckState.value = 'IDLE';
+      aadhaarExisting.value = null;
+      return;
+    }
+    aadhaarCheckState.value = 'CHECKING';
+    final seq = ++_aadhaarSeq;
+    _aadhaarDebounce = Timer(const Duration(milliseconds: 500), () async {
+      try {
+        final res = await _api.checkAadhaar(v);
+        if (seq != _aadhaarSeq) return; // superseded
+        final d = (res['data'] as Map<String, dynamic>?) ?? {};
+        if (d['exists'] != true) {
+          aadhaarCheckState.value = 'NONE';
+          aadhaarExisting.value = null;
+        } else {
+          aadhaarCheckState.value = (d['collisionCase'] ?? 'NONE').toString();
+          aadhaarExisting.value = d['existing'] as Map<String, dynamic>?;
+        }
+      } catch (_) {
+        if (seq != _aadhaarSeq) return;
+        // Never trap the user on a check failure — submit-time check is the net.
+        aadhaarCheckState.value = 'ERROR';
+      }
+    });
+  }
+
+  void _onEmailChanged() {
+    _emailDebounce?.cancel();
+    final v = emailController.text.trim();
+    if (v.isEmpty || !_emailRe.hasMatch(v)) {
+      emailCheckState.value = 'IDLE'; // skip half-typed input
+      return;
+    }
+    emailCheckState.value = 'CHECKING';
+    final seq = ++_emailSeq;
+    _emailDebounce = Timer(const Duration(milliseconds: 500), () async {
+      try {
+        final res = await _api.checkAvailability({'email': v});
+        if (seq != _emailSeq) return;
+        final d = (res['data'] as Map<String, dynamic>?) ?? {};
+        emailCheckState.value = d['emailTaken'] == true ? 'TAKEN' : 'AVAILABLE';
+      } catch (_) {
+        if (seq != _emailSeq) return;
+        emailCheckState.value = 'ERROR';
+      }
+    });
+  }
+
+  void _onPhoneChanged() {
+    _phoneDebounce?.cancel();
+    final v = phoneController.text.trim();
+    if (v.length != 10) {
+      phoneCheckState.value = 'IDLE';
+      return;
+    }
+    phoneCheckState.value = 'CHECKING';
+    final seq = ++_phoneSeq;
+    _phoneDebounce = Timer(const Duration(milliseconds: 500), () async {
+      try {
+        final res = await _api.checkAvailability({'phone': v});
+        if (seq != _phoneSeq) return;
+        final d = (res['data'] as Map<String, dynamic>?) ?? {};
+        phoneCheckState.value = d['phoneTaken'] == true ? 'TAKEN' : 'AVAILABLE';
+      } catch (_) {
+        if (seq != _phoneSeq) return;
+        phoneCheckState.value = 'ERROR';
+      }
+    });
   }
 
   @override
   void onClose() {
+    _aadhaarDebounce?.cancel();
+    _emailDebounce?.cancel();
+    _phoneDebounce?.cancel();
     for (final c in [
       aadhaarController,
       fullNameController,
@@ -277,10 +379,19 @@ class AddEmployeeController extends GetxController {
   bool get aadhaarConsentMissing =>
       aadhaarController.text.length == 12 && !aadhaarConsentGiven.value;
 
+  // A confirmed Aadhaar collision that must block creation. REHIRE / ARCHIVED
+  // are informational (HR may still proceed), so they don't block here.
+  bool get aadhaarBlocking =>
+      aadhaarCheckState.value == 'ACTIVE_DUPLICATE' ||
+      aadhaarCheckState.value == 'PENDING_DUPLICATE';
+
   bool get canSubmit =>
       missingFields.isEmpty &&
       missingDocs.isEmpty &&
       !aadhaarConsentMissing &&
+      !aadhaarBlocking &&
+      emailCheckState.value != 'TAKEN' &&
+      phoneCheckState.value != 'TAKEN' &&
       !submitting.value;
 
   void recomputeMissing() {
@@ -1171,6 +1282,73 @@ class _IdentitySection extends StatelessWidget {
     }
   }
 
+  // Live Aadhaar dedup result, shown under the field. Renders nothing until a
+  // full 12-digit number has been entered and a check has fired.
+  Widget _aadhaarStatus() {
+    return Obx(() {
+      final state = ctrl.aadhaarCheckState.value;
+      if (state == 'IDLE') return const SizedBox.shrink();
+      late IconData icon;
+      late Color color;
+      late String msg;
+      bool spin = false;
+      switch (state) {
+        case 'CHECKING':
+          spin = true;
+          color = AppColors.textTertiary;
+          msg = 'Checking Aadhaar…';
+          break;
+        case 'NONE':
+          icon = Icons.check_circle_rounded;
+          color = AppColors.success;
+          msg = 'Aadhaar is available';
+          break;
+        case 'ACTIVE_DUPLICATE':
+          icon = Icons.cancel_rounded;
+          color = AppColors.danger;
+          msg = 'Already registered to an active employee';
+          break;
+        case 'PENDING_DUPLICATE':
+          icon = Icons.cancel_rounded;
+          color = AppColors.danger;
+          msg = 'A pending onboarding already uses this Aadhaar';
+          break;
+        case 'REHIRE':
+          icon = Icons.history_rounded;
+          color = AppColors.warning;
+          msg = 'Previously employed here — eligible for rehire';
+          break;
+        case 'ARCHIVED':
+          icon = Icons.inventory_2_outlined;
+          color = AppColors.warning;
+          msg = 'Matches an archived employee record';
+          break;
+        default: // ERROR
+          icon = Icons.info_outline_rounded;
+          color = AppColors.textTertiary;
+          msg = "Couldn't verify now — will re-check at submit";
+      }
+      return Padding(
+        padding: const EdgeInsets.only(top: 8, left: 4),
+        child: Row(children: [
+          spin
+              ? SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      valueColor: AlwaysStoppedAnimation<Color>(color)))
+              : Icon(icon, size: 15, color: color),
+          const SizedBox(width: 6),
+          Expanded(
+              child: Text(msg,
+                  style: AppTextStyles.caption
+                      .copyWith(color: color, fontWeight: FontWeight.w500))),
+        ]),
+      );
+    });
+  }
+
   // Prefer the real picked filename (documentNames) — on Flutter Web the
   // File path is a blob URL, so splitting it shows a meaningless UUID.
   String? _fname(String key) {
@@ -1196,6 +1374,8 @@ class _IdentitySection extends StatelessWidget {
         helperText: '12 digits — encrypted; only last 4 shown after save',
         onChanged: (_) => ctrl.recomputeMissing(),
       ),
+      // Live dedup status — updates as the 12th digit is entered.
+      _aadhaarStatus(),
       const SizedBox(height: 12),
 
       // Consent — only shown when 12 digits entered
@@ -1323,6 +1503,56 @@ class _PersonalInfoSection extends StatelessWidget {
     }
   }
 
+  // Compact email/phone availability line. No Obx here — this is called inside
+  // the section's outer Obx, so reading the state value at the call site is
+  // already reactive. Renders nothing until a check has fired.
+  Widget _availRow(String state, String okMsg, String takenMsg) {
+    if (state == 'IDLE') return const SizedBox.shrink();
+    late IconData icon;
+    late Color color;
+    late String msg;
+    bool spin = false;
+    switch (state) {
+      case 'CHECKING':
+        spin = true;
+        color = AppColors.textTertiary;
+        msg = 'Checking…';
+        break;
+      case 'AVAILABLE':
+        icon = Icons.check_circle_rounded;
+        color = AppColors.success;
+        msg = okMsg;
+        break;
+      case 'TAKEN':
+        icon = Icons.cancel_rounded;
+        color = AppColors.danger;
+        msg = takenMsg;
+        break;
+      default: // ERROR
+        icon = Icons.info_outline_rounded;
+        color = AppColors.textTertiary;
+        msg = "Couldn't verify now — will re-check at submit";
+    }
+    return Padding(
+      padding: const EdgeInsets.only(top: 6, left: 4),
+      child: Row(children: [
+        spin
+            ? SizedBox(
+                width: 13,
+                height: 13,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation<Color>(color)))
+            : Icon(icon, size: 14, color: color),
+        const SizedBox(width: 6),
+        Expanded(
+            child: Text(msg,
+                style: AppTextStyles.caption
+                    .copyWith(color: color, fontWeight: FontWeight.w500))),
+      ]),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     // Read employmentType once via Obx at the top level of this section
@@ -1360,6 +1590,9 @@ class _PersonalInfoSection extends StatelessWidget {
             required: req('email'),
             keyboardType: TextInputType.emailAddress,
             onChanged: (_) => ctrl.recomputeMissing()),
+        // Live availability (reads inside the section's outer Obx).
+        _availRow(ctrl.emailCheckState.value, 'Email is available',
+            'Email already in use'),
         const SizedBox(height: 12),
         AppTextField(
             label: 'Phone Number',
@@ -1372,6 +1605,8 @@ class _PersonalInfoSection extends StatelessWidget {
               LengthLimitingTextInputFormatter(10),
             ],
             onChanged: (_) => ctrl.recomputeMissing()),
+        _availRow(ctrl.phoneCheckState.value, 'Phone is available',
+            'Phone already in use'),
         const SizedBox(height: 12),
         AppTextField(
             label: 'Second Mobile',
