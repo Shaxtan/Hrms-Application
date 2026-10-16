@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:intl/intl.dart';
 import 'package:shimmer/shimmer.dart';
 import '../../../../core/theme/app_theme.dart';
@@ -20,16 +21,34 @@ import 'profile_page.dart';
 // ATTENDANCE CONTROLLER — real API: punch-in/out + today status
 // ═══════════════════════════════════════════════════════════════════════════════
 class AttendanceController extends GetxController {
+  // Three-state model mirroring the web portal's CheckInOutPage:
+  //   NOT_CHECKED_IN -> CHECKED_IN -> CHECKED_OUT
+  // `isCheckedIn` is kept in sync so existing widgets keep working.
+  static const String statusNotIn = 'NOT_CHECKED_IN';
+  static const String statusIn = 'CHECKED_IN';
+  static const String statusOut = 'CHECKED_OUT';
+
+  final attendanceStatus = statusNotIn.obs;
   final isCheckedIn = false.obs;
   final checkInTime = Rxn<DateTime>();
   final checkOutTime = Rxn<DateTime>();
   final currentTime = DateTime.now().obs;
   final elapsedSecs = 0.obs;
   final isPunching = false.obs;
+  final isLoadingStatus = false.obs;
+  final employeeId = Rxn<int>();
   Timer? _clockTimer;
   Timer? _elapsedTimer;
 
+  // Punch source. 'WEB' is the only value proven against this backend — it is
+  // exactly what the working web portal sends. Change to 'MOBILE' only if the
+  // backend PunchSource enum accepts it.
+  static const String _punchSource = 'WEB';
+
   final Dio _dio = ApiClient.instance;
+  static const _storage = FlutterSecureStorage();
+
+  bool get hasCheckedOut => attendanceStatus.value == statusOut;
 
   @override
   void onInit() {
@@ -37,7 +56,7 @@ class AttendanceController extends GetxController {
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       currentTime.value = DateTime.now();
     });
-    _fetchTodayStatus();
+    fetchTodayStatus();
   }
 
   @override
@@ -47,9 +66,58 @@ class AttendanceController extends GetxController {
     super.onClose();
   }
 
-  Future<void> _fetchTodayStatus() async {
+  // ── Employee id resolution ────────────────────────────────────────────────
+  // punch-in / punch-out and the ledger all need the logged-in employee's id.
+  // Order: cached -> secure storage (written at login) -> JWT claim ->
+  // first row of /employees/list (that row is the logged-in user).
+  Future<int?> _resolveEmployeeId() async {
+    if (employeeId.value != null) return employeeId.value;
+
+    final stored = await _storage.read(key: 'employee_id');
+    final fromStore = int.tryParse(stored ?? '');
+    if (fromStore != null) {
+      employeeId.value = fromStore;
+      return fromStore;
+    }
+
+    final token = await _storage.read(key: 'auth_token');
+    final fromJwt = ApiClient.getEmployeeIdFromToken(token);
+    if (fromJwt != null) {
+      employeeId.value = fromJwt;
+      return fromJwt;
+    }
+
     try {
-      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      // sortBy MUST be 'firstName' — 'fullName' makes this endpoint 500.
+      final res = await _dio.post('/api/v1/employees/list', data: {
+        'page': 0,
+        'size': 1,
+        'sortBy': 'firstName',
+        'sortDir': 'ASC',
+        'filters': {},
+      });
+      final list = res.data?['data'] as List?;
+      if (list != null && list.isNotEmpty) {
+        final raw = (list.first as Map)['employeeId'];
+        final parsed = raw is int ? raw : int.tryParse(raw?.toString() ?? '');
+        employeeId.value = parsed;
+        return parsed;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // ── Today's status ────────────────────────────────────────────────────────
+  // Primary source is POST /attendance/list (the exact call the web portal
+  // makes — the backend auto-scopes it to the JWT owner). If that comes back
+  // empty we fall back to GET /attendance/ledger, which returns the full day
+  // object under `day` when `recorded` is true.
+  Future<void> fetchTodayStatus() async {
+    isLoadingStatus.value = true;
+    final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+    Map<String, dynamic>? record;
+
+    try {
       final res = await _dio.post('/api/v1/attendance/list', data: {
         'page': 0,
         'size': 1,
@@ -57,52 +125,101 @@ class AttendanceController extends GetxController {
         'sortDir': 'DESC',
         'filters': {'dateFrom': today, 'dateTo': today},
       });
-      final record = (res.data?['data'] as List?)?.isNotEmpty == true
-          ? res.data['data'][0] as Map<String, dynamic>
-          : null;
-      if (record == null) return;
-
-      final punchIn = record['punchInTime'] ?? record['punchInTimeIST'];
-      final punchOut = record['punchOutTime'] ?? record['punchOutTimeIST'];
-      if (punchIn != null)
-        checkInTime.value = DateTime.tryParse(punchIn.toString());
-      if (punchOut != null)
-        checkOutTime.value = DateTime.tryParse(punchOut.toString());
-
-      if (checkInTime.value != null && checkOutTime.value == null) {
-        isCheckedIn.value = true;
-        elapsedSecs.value =
-            DateTime.now().difference(checkInTime.value!).inSeconds;
-        _elapsedTimer?.cancel();
-        _elapsedTimer = Timer.periodic(
-            const Duration(seconds: 1), (_) => elapsedSecs.value++);
-      } else if (checkOutTime.value != null) {
-        isCheckedIn.value = false;
-        elapsedSecs.value =
-            checkOutTime.value!.difference(checkInTime.value!).inSeconds;
+      final list = res.data?['data'] as List?;
+      if (list != null && list.isNotEmpty) {
+        record = Map<String, dynamic>.from(list.first as Map);
       }
     } catch (_) {}
+
+    if (record == null) {
+      final empId = await _resolveEmployeeId();
+      if (empId != null) {
+        try {
+          final res = await _dio.get('/api/v1/attendance/ledger',
+              queryParameters: {
+                'employeeId': empId,
+                'from': today,
+                'to': today
+              });
+          final list = res.data?['data'] as List?;
+          if (list != null && list.isNotEmpty) {
+            final entry = Map<String, dynamic>.from(list.first as Map);
+            if (entry['recorded'] == true && entry['day'] is Map) {
+              record = Map<String, dynamic>.from(entry['day'] as Map);
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    _applyRecord(record);
+    isLoadingStatus.value = false;
   }
+
+  /// Single place that derives UI state from an attendance record.
+  /// Passing null resets to NOT_CHECKED_IN (the old code returned early and
+  /// left stale state behind).
+  void _applyRecord(Map<String, dynamic>? record) {
+    _elapsedTimer?.cancel();
+
+    final inRaw = record?['punchInTime'] ?? record?['punchInTimeIST'];
+    final outRaw = record?['punchOutTime'] ?? record?['punchOutTimeIST'];
+
+    // toLocal() matters: the API returns UTC ("…T03:37:00.226Z"). Without it
+    // a 09:07 AM IST punch rendered as 03:37 AM.
+    final pin =
+        inRaw == null ? null : DateTime.tryParse(inRaw.toString())?.toLocal();
+    final pout =
+        outRaw == null ? null : DateTime.tryParse(outRaw.toString())?.toLocal();
+
+    checkInTime.value = pin;
+    checkOutTime.value = pout;
+
+    if (pin == null) {
+      attendanceStatus.value = statusNotIn;
+      isCheckedIn.value = false;
+      elapsedSecs.value = 0;
+    } else if (pout == null) {
+      attendanceStatus.value = statusIn;
+      isCheckedIn.value = true;
+      elapsedSecs.value =
+          DateTime.now().difference(pin).inSeconds.clamp(0, 86400).toInt();
+      _elapsedTimer = Timer.periodic(
+          const Duration(seconds: 1), (_) => elapsedSecs.value++);
+    } else {
+      attendanceStatus.value = statusOut;
+      isCheckedIn.value = false;
+      elapsedSecs.value =
+          pout.difference(pin).inSeconds.clamp(0, 86400).toInt();
+    }
+  }
+
+  Map<String, dynamic> _punchPayload(int? empId) => {
+        'employeeId': empId,
+        'punchTime': DateTime.now().toUtc().toIso8601String(),
+        'punchSource': _punchSource,
+        'latitude': null,
+        'longitude': null,
+      };
 
   Future<void> checkIn() async {
     if (isPunching.value) return;
     isPunching.value = true;
     try {
-      await _dio.post('/api/v1/attendance/punch-in', data: {});
-      checkInTime.value = DateTime.now();
-      checkOutTime.value = null;
-      isCheckedIn.value = true;
-      elapsedSecs.value = 0;
-      _elapsedTimer?.cancel();
-      _elapsedTimer = Timer.periodic(
-          const Duration(seconds: 1), (_) => elapsedSecs.value++);
-      Get.snackbar('Checked In', 'Attendance recorded.',
+      final empId = await _resolveEmployeeId();
+      // The old code posted an empty body — no employeeId, no punchTime — so
+      // the backend had nothing to record. This is the real fix.
+      await _dio.post('/api/v1/attendance/punch-in',
+          data: _punchPayload(empId));
+      // Re-read from the server so the displayed times are authoritative.
+      await fetchTodayStatus();
+      Get.snackbar('Checked In', 'Attendance recorded at $checkInDisplay.',
           backgroundColor: AppColors.success,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
           margin: const EdgeInsets.all(16));
     } on DioException catch (e) {
-      Get.snackbar('Failed', ApiFailure.fromDioException(e).message,
+      Get.snackbar('Check-in failed', ApiFailure.fromDioException(e).message,
           backgroundColor: AppColors.danger,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
@@ -116,17 +233,17 @@ class AttendanceController extends GetxController {
     if (isPunching.value) return;
     isPunching.value = true;
     try {
-      await _dio.post('/api/v1/attendance/punch-out', data: {});
-      checkOutTime.value = DateTime.now();
-      isCheckedIn.value = false;
-      _elapsedTimer?.cancel();
-      Get.snackbar('Checked Out', 'Attendance recorded.',
+      final empId = await _resolveEmployeeId();
+      await _dio.post('/api/v1/attendance/punch-out',
+          data: _punchPayload(empId));
+      await fetchTodayStatus();
+      Get.snackbar('Checked Out', 'Attendance recorded at $checkOutDisplay.',
           backgroundColor: AppColors.info,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
           margin: const EdgeInsets.all(16));
     } on DioException catch (e) {
-      Get.snackbar('Failed', ApiFailure.fromDioException(e).message,
+      Get.snackbar('Check-out failed', ApiFailure.fromDioException(e).message,
           backgroundColor: AppColors.danger,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
@@ -206,6 +323,7 @@ class _MainShellState extends State<MainShell> {
 
   @override
   Widget build(BuildContext context) {
+    // Read theme once — no Obx here; Scaffold bg is static per build
     final t = ThemeController.to;
     return Scaffold(
       backgroundColor: t.bg,
@@ -257,6 +375,7 @@ class _BottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Obx only here so border/bg update on theme toggle
     return Obx(() {
       final t = ThemeController.to;
       return Container(
@@ -322,7 +441,7 @@ class _BottomNav extends StatelessWidget {
                             horizontal: 12, vertical: 5),
                         decoration: BoxDecoration(
                             color: sel
-                                ? AppColors.accent.withOpacity(0.12)
+                                ? AppColors.accentLight
                                 : Colors.transparent,
                             borderRadius:
                                 BorderRadius.circular(AppRadius.full)),
@@ -350,7 +469,7 @@ class _BottomNav extends StatelessWidget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SIDEBAR
+// SIDEBAR — no Obx wrapper; reads t/auth directly in build()
 // ═══════════════════════════════════════════════════════════════════════════════
 class _Sidebar extends StatelessWidget {
   final VoidCallback onClose;
@@ -393,6 +512,7 @@ class _Sidebar extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // Header — dark gradient always
               Container(
                 padding: const EdgeInsets.fromLTRB(20, 20, 20, 20),
                 decoration: const BoxDecoration(
@@ -402,6 +522,7 @@ class _Sidebar extends StatelessWidget {
                       end: Alignment.bottomRight),
                 ),
                 child: Row(children: [
+                  // Avatar uses Obx for initials only
                   Obx(() => CircleAvatar(
                         radius: 24,
                         backgroundColor: Colors.white.withOpacity(0.2),
@@ -443,13 +564,14 @@ class _Sidebar extends StatelessWidget {
                   ),
                 ]),
               ),
+
               Padding(
                 padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
                 child: Obx(() => Container(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 10, vertical: 5),
                       decoration: BoxDecoration(
-                          color: AppColors.accent.withOpacity(0.12),
+                          color: AppColors.accentLight,
                           borderRadius: BorderRadius.circular(AppRadius.full)),
                       child: Row(mainAxisSize: MainAxisSize.min, children: [
                         const Icon(Icons.business_rounded,
@@ -462,11 +584,13 @@ class _Sidebar extends StatelessWidget {
                       ]),
                     )),
               ),
+
               Padding(
                 padding:
                     const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
                 child: Divider(color: t.border),
               ),
+
               Expanded(
                 child: ListView(
                   padding:
@@ -508,6 +632,7 @@ class _Sidebar extends StatelessWidget {
                   ],
                 ),
               ),
+
               Padding(
                 padding: const EdgeInsets.all(16),
                 child: GestureDetector(
@@ -518,7 +643,7 @@ class _Sidebar extends StatelessWidget {
                   child: Container(
                     padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
-                      color: AppColors.danger.withOpacity(0.12),
+                      color: AppColors.dangerLight,
                       borderRadius: BorderRadius.circular(AppRadius.lg),
                       border:
                           Border.all(color: AppColors.danger.withOpacity(0.25)),
@@ -594,7 +719,7 @@ class _SidebarTile extends StatelessWidget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// DASHBOARD PAGE
+// DASHBOARD PAGE — no outer Obx; sub-widgets handle their own reactivity
 // ═══════════════════════════════════════════════════════════════════════════════
 class DashboardPage extends StatelessWidget {
   const DashboardPage({super.key});
@@ -602,53 +727,96 @@ class DashboardPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ctrl = Get.put(DashboardController());
-    // Wrap the entire scaffold in Obx so backgroundColor and all t.* values
-    // rebuild whenever the theme toggles — without this the page background
-    // stays frozen to whatever colour was active at first build.
-    return Obx(() {
-      final t = ThemeController.to;
-      return Scaffold(
-        backgroundColor: t.bg,
-        body: CustomScrollView(slivers: [
-          _DashboardSliverAppBar(),
-          SliverPadding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-            sliver: SliverList(
-                delegate: SliverChildListDelegate([
-              const SizedBox(height: 16),
-              // ── Workforce Stats Grid ─────────────────────────────────────
-              Obx(() => ctrl.workforce.value != null
-                  ? _WorkforceStatsGrid(ctrl: ctrl)
-                  : const SizedBox.shrink()),
-              const SizedBox(height: 16),
-              // ── Secondary KPI Row ────────────────────────────────────────
-              Obx(() => ctrl.workforce.value != null
-                  ? _SecondaryKpiRow(ctrl: ctrl)
-                  : const SizedBox.shrink()),
-              const SizedBox(height: 16),
-              // ── Supervisor Pipeline (if available) ───────────────────────
-              Obx(() => ctrl.supervisorMetrics.value != null
-                  ? _HeroCards(ctrl: ctrl)
-                  : const SizedBox.shrink()),
-              const SizedBox(height: 16),
-              // ── Employee Quick List ──────────────────────────────────────
-              const _EmployeeQuickList(),
-              const SizedBox(height: 16),
-              // ── Recent Onboarding ────────────────────────────────────────
-              Obx(() => ctrl.recentOnboarding.isNotEmpty
-                  ? _RecentOnboardingSection(ctrl: ctrl)
-                  : const SizedBox.shrink()),
-              const SizedBox(height: 16),
-              // ── Pending Approvals ────────────────────────────────────────
-              Obx(() => ctrl.pendingApprovals.isNotEmpty
-                  ? _PendingTile(ctrl: ctrl)
-                  : const SizedBox.shrink()),
-              const SizedBox(height: 80),
-            ])),
-          ),
+    final t = ThemeController.to;
+    return Scaffold(
+      backgroundColor: t.bg,
+      // Pull-to-refresh: re-fetches the dashboard summary. The other tabs
+      // (Employees, Approvals) already have this — the main screen was the
+      // only one without a way to refresh short of restarting the app.
+      body: RefreshIndicator(
+        onRefresh: ctrl.load,
+        color: AppColors.accent,
+        child: CustomScrollView(
+            physics: const AlwaysScrollableScrollPhysics(
+                parent: BouncingScrollPhysics()),
+            slivers: [
+              _DashboardSliverAppBar(),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                sliver: SliverList(
+                    delegate: SliverChildListDelegate([
+                  const SizedBox(height: 16),
+                  // ── Workforce Stats Cards (shimmer skeleton on first load) ──
+                  Obx(() {
+                    if (ctrl.workforce.value != null) {
+                      return _WorkforceStatsGrid(ctrl: ctrl);
+                    }
+                    return ctrl.loading.value
+                        ? const _DashboardSkeleton()
+                        : const SizedBox.shrink();
+                  }),
+                  const SizedBox(height: 16),
+                  // ── Secondary KPI Row ──────────────────────────────────────
+                  Obx(() => ctrl.workforce.value != null
+                      ? _SecondaryKpiRow(ctrl: ctrl)
+                      : const SizedBox.shrink()),
+                  const SizedBox(height: 16),
+                  // ── Supervisor Pipeline (if available) ─────────────────────
+                  Obx(() => ctrl.supervisorMetrics.value != null
+                      ? _HeroCards(ctrl: ctrl)
+                      : const SizedBox.shrink()),
+                  const SizedBox(height: 16),
+                  // ── Employee List ──────────────────────────────────────────
+                  _EmployeeQuickList(t: t),
+                  const SizedBox(height: 16),
+                  // ── Recent Onboarding ──────────────────────────────────────
+                  Obx(() => ctrl.recentOnboarding.isNotEmpty
+                      ? _RecentOnboardingSection(ctrl: ctrl, t: t)
+                      : const SizedBox.shrink()),
+                  const SizedBox(height: 16),
+                  Obx(() => ctrl.pendingApprovals.isNotEmpty
+                      ? _PendingTile(ctrl: ctrl)
+                      : const SizedBox.shrink()),
+                  const SizedBox(height: 80),
+                ])),
+              ),
+            ]),
+      ),
+    );
+  }
+}
+
+// ── Dashboard loading skeleton — shimmer placeholders matching the stat grid ──
+class _DashboardSkeleton extends StatelessWidget {
+  const _DashboardSkeleton();
+
+  @override
+  Widget build(BuildContext context) {
+    final t = ThemeController.to;
+    Widget box(double h, {double? w, double r = AppRadius.lg}) => Container(
+        height: h,
+        width: w,
+        decoration: BoxDecoration(
+            color: t.surface, borderRadius: BorderRadius.circular(r)));
+    return Shimmer.fromColors(
+      baseColor: t.surface,
+      highlightColor: t.surfaceVar,
+      child: Column(children: [
+        Row(children: [
+          Expanded(child: box(96)),
+          const SizedBox(width: 10),
+          Expanded(child: box(96)),
         ]),
-      );
-    });
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(child: box(96)),
+          const SizedBox(width: 10),
+          Expanded(child: box(96)),
+        ]),
+        const SizedBox(height: 16),
+        box(64),
+      ]),
+    );
   }
 }
 
@@ -674,7 +842,7 @@ class _DashboardSliverAppBar extends StatelessWidget {
             const SizedBox(height: 24),
             Obx(() => CircleAvatar(
                 radius: 36,
-                backgroundColor: AppColors.accent.withOpacity(0.12),
+                backgroundColor: AppColors.accentLight,
                 child: Text(auth.userInitials.value,
                     style: AppTextStyles.displayMedium
                         .copyWith(color: AppColors.accent, fontSize: 24)))),
@@ -727,6 +895,7 @@ class _DashboardSliverAppBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Obx here so app bar bg/text reacts to theme toggle
     return Obx(() {
       final t = ThemeController.to;
       final auth = Get.find<AuthController>();
@@ -775,7 +944,7 @@ class _DashboardSliverAppBar extends StatelessWidget {
               padding: const EdgeInsets.only(right: 14),
               child: CircleAvatar(
                   radius: 17,
-                  backgroundColor: AppColors.accent.withOpacity(0.12),
+                  backgroundColor: AppColors.accentLight,
                   child: Text(
                       auth.userInitials.value.isNotEmpty
                           ? auth.userInitials.value
@@ -796,11 +965,11 @@ class _DashboardSliverAppBar extends StatelessWidget {
 
 // ── Employee Quick List ────────────────────────────────────────────────────────
 class _EmployeeQuickList extends StatelessWidget {
-  const _EmployeeQuickList();
+  final ThemeController t;
+  const _EmployeeQuickList({required this.t});
 
   @override
   Widget build(BuildContext context) {
-    final t = ThemeController.to;
     final empCtrl = Get.find<EmployeeController>();
     return Container(
       decoration: BoxDecoration(
@@ -830,7 +999,7 @@ class _EmployeeQuickList extends StatelessWidget {
                   padding:
                       const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                   decoration: BoxDecoration(
-                      color: AppColors.accent.withOpacity(0.12),
+                      color: AppColors.accentLight,
                       borderRadius: BorderRadius.circular(AppRadius.full)),
                   child: Text('View all',
                       style: AppTextStyles.caption.copyWith(
@@ -933,89 +1102,8 @@ class _QuickEmpRow extends StatelessWidget {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// UNIFIED STAT CARD
-// The single card component used throughout the dashboard for all KPI/metric
-// displays. Colour accent bar at the top, large value, label, optional subtitle,
-// icon badge at top-right. All dashboard metric sections use this or _MiniStatCard.
-// ═══════════════════════════════════════════════════════════════════════════════
-class _StatCard extends StatelessWidget {
-  final String title;
-  final String value;
-  final String subtitle;
-  final IconData icon;
-  final Color color;
-  final ThemeController t;
-
-  const _StatCard({
-    required this.title,
-    required this.value,
-    required this.subtitle,
-    required this.icon,
-    required this.color,
-    required this.t,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: t.surface,
-        borderRadius: BorderRadius.circular(AppRadius.lg),
-        border: Border.all(color: t.border),
-        boxShadow: t.cardShadow,
-      ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        // Colour accent bar — identifies the metric category at a glance
-        Container(
-            height: 3,
-            width: 40,
-            decoration: BoxDecoration(
-                color: color,
-                borderRadius: BorderRadius.circular(AppRadius.full))),
-        const SizedBox(height: 10),
-        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Expanded(
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                Text(title,
-                    style: AppTextStyles.caption.copyWith(
-                        color: t.textSec,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w500,
-                        height: 1.3)),
-                const SizedBox(height: 4),
-                Text(value,
-                    style: AppTextStyles.numericLarge.copyWith(
-                        color: t.textPrimary,
-                        fontSize: 28,
-                        fontWeight: FontWeight.w700)),
-                if (subtitle.isNotEmpty) ...[
-                  const SizedBox(height: 2),
-                  Text(subtitle,
-                      style: AppTextStyles.caption
-                          .copyWith(color: t.textTert, fontSize: 10)),
-                ],
-              ])),
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: color.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(AppRadius.md),
-            ),
-            child: Icon(icon, color: color, size: 20),
-          ),
-        ]),
-      ]),
-    );
-  }
-}
-
-// ── Workforce Stats Grid ───────────────────────────────────────────────────────
-// 7 cards in a 2-column grid. The last card (Deactivated) gets a matching
-// spacer column so it aligns with cards above instead of stretching full-width.
+// ── Hero Cards — reads t directly, no Obx wrapper ─────────────────────────────
+// ── Workforce Stats Grid (matches web portal) ─────────────────────────────────
 class _WorkforceStatsGrid extends StatelessWidget {
   final DashboardController ctrl;
   const _WorkforceStatsGrid({required this.ctrl});
@@ -1025,6 +1113,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
     final t = ThemeController.to;
     final w = ctrl.workforce.value!;
     return Column(children: [
+      // Row 1: Total, Deployed, Unassigned, Pending Onboarding
       Row(children: [
         Expanded(
             child: _StatCard(
@@ -1033,6 +1122,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: '${w.working} working',
                 icon: Icons.people_rounded,
                 color: AppColors.accent,
+                borderColor: AppColors.accent,
                 t: t)),
         const SizedBox(width: 10),
         Expanded(
@@ -1042,6 +1132,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: 'Billable',
                 icon: Icons.business_center_rounded,
                 color: AppColors.success,
+                borderColor: AppColors.success,
                 t: t)),
       ]),
       const SizedBox(height: 10),
@@ -1053,6 +1144,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: '${w.unassignedPct.toStringAsFixed(0)}% of working',
                 icon: Icons.warning_amber_rounded,
                 color: AppColors.warning,
+                borderColor: AppColors.warning,
                 t: t)),
         const SizedBox(width: 10),
         Expanded(
@@ -1062,9 +1154,11 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: 'Awaiting approval',
                 icon: Icons.schedule_rounded,
                 color: AppColors.info,
+                borderColor: AppColors.info,
                 t: t)),
       ]),
       const SizedBox(height: 10),
+      // Row 2: Pending Salary, Rejected, Deactivated
       Row(children: [
         Expanded(
             child: _StatCard(
@@ -1073,6 +1167,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: 'Awaiting compensation',
                 icon: Icons.attach_money_rounded,
                 color: const Color(0xFFD97706),
+                borderColor: const Color(0xFFD97706),
                 t: t)),
         const SizedBox(width: 10),
         Expanded(
@@ -1082,10 +1177,10 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: '',
                 icon: Icons.cancel_outlined,
                 color: AppColors.danger,
+                borderColor: AppColors.danger,
                 t: t)),
       ]),
       const SizedBox(height: 10),
-      // Deactivated — half-width to match the column rhythm above
       Row(children: [
         Expanded(
             child: _StatCard(
@@ -1094,17 +1189,97 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: '',
                 icon: Icons.person_off_rounded,
                 color: const Color(0xFF6B7280),
+                borderColor: const Color(0xFF6B7280),
                 t: t)),
-        const SizedBox(width: 10),
-        const Expanded(child: SizedBox()),
+        const Expanded(child: SizedBox()), // spacer
       ]),
     ]);
   }
 }
 
-// ── Secondary KPI Row ──────────────────────────────────────────────────────────
-// Five compact metric tiles in a horizontal scroll — same card decoration as
-// _StatCard (border, shadow, accent bar) so they sit in the same design system.
+class _StatCard extends StatelessWidget {
+  final String title, value, subtitle;
+  final IconData icon;
+  final Color color, borderColor;
+  final ThemeController t;
+  const _StatCard(
+      {required this.title,
+      required this.value,
+      required this.subtitle,
+      required this.icon,
+      required this.color,
+      required this.borderColor,
+      required this.t});
+
+  @override
+  Widget build(BuildContext context) {
+    // Entrance animation: cards fade in and rise slightly when the data
+    // arrives — runs once per build of the grid, no controller needed.
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeOutCubic,
+      builder: (context, v, child) => Opacity(
+          opacity: v,
+          child: Transform.translate(
+              offset: Offset(0, 12 * (1 - v)), child: child)),
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: t.surface,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: t.border),
+          boxShadow: t.cardShadow,
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // Top color accent bar
+          Container(
+              height: 3,
+              width: 40,
+              decoration: BoxDecoration(
+                  color: borderColor,
+                  borderRadius: BorderRadius.circular(AppRadius.full))),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  Text(title,
+                      style: AppTextStyles.caption.copyWith(
+                          color: t.textSec,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                          height: 1.3)),
+                  const SizedBox(height: 4),
+                  Text(value,
+                      style: AppTextStyles.numericLarge.copyWith(
+                          color: t.textPrimary,
+                          fontSize: 28,
+                          fontWeight: FontWeight.w700)),
+                  if (subtitle.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(subtitle,
+                        style: AppTextStyles.caption
+                            .copyWith(color: t.textTert, fontSize: 10)),
+                  ],
+                ])),
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: color.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(AppRadius.md),
+              ),
+              child: Icon(icon, color: color, size: 20),
+            ),
+          ]),
+        ]),
+      ),
+    );
+  }
+}
+
+// ── Secondary KPI Row (Working / Unassigned Ratio / On Probation / New Joiners / Exits) ──
 class _SecondaryKpiRow extends StatelessWidget {
   final DashboardController ctrl;
   const _SecondaryKpiRow({required this.ctrl});
@@ -1113,114 +1288,104 @@ class _SecondaryKpiRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = ThemeController.to;
     final w = ctrl.workforce.value!;
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      clipBehavior: Clip.none,
-      child: Row(children: [
-        _MiniStatCard(
-            value: '${w.working}',
-            label: 'Working',
-            icon: Icons.people_outline_rounded,
-            color: AppColors.accent,
-            t: t),
-        const SizedBox(width: 10),
-        _MiniStatCard(
-            value: '${w.unassignedPct.toStringAsFixed(0)}%',
-            label: 'Unassigned\nRatio',
-            icon: Icons.pie_chart_outline_rounded,
-            color: AppColors.warning,
-            t: t),
-        const SizedBox(width: 10),
-        _MiniStatCard(
-            value: '${w.onProbation}',
-            label: 'On Probation',
-            icon: Icons.hourglass_top_rounded,
-            color: const Color(0xFF7C3AED),
-            t: t),
-        const SizedBox(width: 10),
-        _MiniStatCard(
-            value: '${w.newJoinersThisMonth}',
-            label: 'New Joiners\n(this mo.)',
-            icon: Icons.person_add_outlined,
-            color: AppColors.success,
-            t: t),
-        const SizedBox(width: 10),
-        _MiniStatCard(
-            value: '${w.exitsThisMonth}',
-            label: 'Exits\n(this mo.)',
-            icon: Icons.exit_to_app_rounded,
-            color: AppColors.danger,
-            t: t),
-      ]),
+    return Container(
+      decoration: BoxDecoration(
+          color: t.surface,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: t.border),
+          boxShadow: t.cardShadow),
+      child: IntrinsicHeight(
+          child: Row(children: [
+        _kpiCell('${w.working}', 'Working', t),
+        _divider(t),
+        _kpiCell(
+            '${w.unassignedPct.toStringAsFixed(0)}%', 'Unassigned Ratio', t),
+        _divider(t),
+        _kpiCell('${w.onProbation}', 'On Probation', t),
+        _divider(t),
+        _kpiCell('${w.newJoinersThisMonth}', 'New Joiners (mo)', t),
+        _divider(t),
+        _kpiCell('${w.exitsThisMonth}', 'Exits (mo)', t),
+      ])),
     );
   }
+
+  Widget _kpiCell(String value, String label, ThemeController t) => Expanded(
+          child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Text(value,
+              style: AppTextStyles.numericMedium.copyWith(
+                  color: t.textPrimary,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700)),
+          const SizedBox(height: 2),
+          Text(label,
+              style:
+                  AppTextStyles.caption.copyWith(color: t.textSec, fontSize: 9),
+              textAlign: TextAlign.center),
+        ]),
+      ));
+
+  Widget _divider(ThemeController t) => Container(width: 1, color: t.border);
 }
 
-/// Compact variant of _StatCard for secondary KPI tiles.
-/// Same accent bar + card decoration as _StatCard; smaller value font (22 vs 28)
-/// so 5 tiles fit comfortably in a horizontal scroll.
-class _MiniStatCard extends StatelessWidget {
-  final String value;
-  final String label;
-  final IconData icon;
-  final Color color;
+// ── Recent Onboarding Section (from real API data.recentOnboarding) ────────────
+class _RecentOnboardingSection extends StatelessWidget {
+  final DashboardController ctrl;
   final ThemeController t;
-  const _MiniStatCard({
-    required this.value,
-    required this.label,
-    required this.icon,
-    required this.color,
-    required this.t,
-  });
+  const _RecentOnboardingSection({required this.ctrl, required this.t});
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 110,
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: t.surface,
-        borderRadius: BorderRadius.circular(AppRadius.lg),
-        border: Border.all(color: t.border),
-        boxShadow: t.cardShadow,
-      ),
+          color: t.surface,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: t.border),
+          boxShadow: t.cardShadow),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Container(
-            height: 3,
-            width: 32,
-            decoration: BoxDecoration(
-                color: color,
-                borderRadius: BorderRadius.circular(AppRadius.full))),
-        const SizedBox(height: 8),
-        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Expanded(
-              child: Text(value,
-                  style: AppTextStyles.numericLarge.copyWith(
-                      color: t.textPrimary,
-                      fontSize: 22,
-                      fontWeight: FontWeight.w700))),
-          Container(
-            padding: const EdgeInsets.all(6),
-            decoration: BoxDecoration(
-              color: color.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(AppRadius.sm),
-            ),
-            child: Icon(icon, color: color, size: 14),
-          ),
+        Row(children: [
+          Text('Recent Onboarding',
+              style: AppTextStyles.headingSmall.copyWith(color: t.textPrimary)),
+          const Spacer(),
+          Text('${ctrl.recentOnboarding.length} records',
+              style: AppTextStyles.caption.copyWith(color: t.textTert)),
         ]),
-        const SizedBox(height: 4),
-        Text(label,
-            style: AppTextStyles.caption
-                .copyWith(color: t.textSec, fontSize: 10, height: 1.3),
-            maxLines: 2),
+        const SizedBox(height: 12),
+        ...ctrl.recentOnboarding.map((e) => Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(children: [
+                CircleAvatar(
+                    radius: 16,
+                    backgroundColor: AppColors.accentLight,
+                    child: Text(
+                        e.name.isNotEmpty ? e.name[0].toUpperCase() : '?',
+                        style: AppTextStyles.caption.copyWith(
+                            color: AppColors.accent,
+                            fontWeight: FontWeight.w700))),
+                const SizedBox(width: 10),
+                Expanded(
+                    child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                      Text(e.name,
+                          style: AppTextStyles.bodySmall.copyWith(
+                              color: t.textPrimary,
+                              fontWeight: FontWeight.w600)),
+                      Text('ID: ${e.employeeId}',
+                          style: AppTextStyles.caption
+                              .copyWith(color: t.textTert, fontSize: 10)),
+                    ])),
+                StatusBadge(status: e.status),
+              ]),
+            )),
       ]),
     );
   }
 }
 
-// ── Hero Cards (Supervisor Pipeline + Managed Workforce) ──────────────────────
-// Pipeline mini-stats now use _PipelineStat tiles (card-shaped, consistent
-// with the rest of the dashboard) instead of bare text columns.
 class _HeroCards extends StatelessWidget {
   final DashboardController ctrl;
   const _HeroCards({required this.ctrl});
@@ -1230,7 +1395,6 @@ class _HeroCards extends StatelessWidget {
     final t = ThemeController.to;
     final me = ctrl.supervisorMetrics.value!;
     return Column(children: [
-      // ── Onboarding Pipeline ──
       Container(
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
@@ -1249,7 +1413,7 @@ class _HeroCards extends StatelessWidget {
             Container(
                 padding: const EdgeInsets.all(7),
                 decoration: BoxDecoration(
-                    color: AppColors.accent.withOpacity(0.12),
+                    color: AppColors.accentLight,
                     borderRadius: BorderRadius.circular(AppRadius.sm)),
                 child: const Icon(Icons.emoji_events_rounded,
                     color: AppColors.accent, size: 16)),
@@ -1262,38 +1426,15 @@ class _HeroCards extends StatelessWidget {
                   style: AppTextStyles.caption.copyWith(color: t.textTert)),
             ]),
           ]),
-          const SizedBox(height: 14),
-          // Pipeline stats — 2×2 grid of consistent tiles
+          const SizedBox(height: 16),
           Row(children: [
-            Expanded(
-                child: _PipelineStat(
-                    value: me.onboarded.toString(),
-                    label: 'Total Raised',
-                    color: t.textPrimary,
-                    t: t)),
-            const SizedBox(width: 8),
-            Expanded(
-                child: _PipelineStat(
-                    value: me.pending.toString(),
-                    label: 'Pending',
-                    color: AppColors.pipelinePending,
-                    t: t)),
-          ]),
-          const SizedBox(height: 8),
-          Row(children: [
-            Expanded(
-                child: _PipelineStat(
-                    value: me.approved.toString(),
-                    label: 'Approved',
-                    color: AppColors.pipelineApproved,
-                    t: t)),
-            const SizedBox(width: 8),
-            Expanded(
-                child: _PipelineStat(
-                    value: me.rejected.toString(),
-                    label: 'Rejected',
-                    color: AppColors.pipelineRejected,
-                    t: t)),
+            _mini(me.onboarded.toString(), 'Total Raised', t.textPrimary, t),
+            _mini(
+                me.pending.toString(), 'Pending', AppColors.pipelinePending, t),
+            _mini(me.approved.toString(), 'Approved',
+                AppColors.pipelineApproved, t),
+            _mini(me.rejected.toString(), 'Rejected',
+                AppColors.pipelineRejected, t),
           ]),
           const SizedBox(height: 12),
           PipelineStatusBar(
@@ -1329,7 +1470,6 @@ class _HeroCards extends StatelessWidget {
         ]),
       ),
       const SizedBox(height: 10),
-      // ── Managed Workforce ──
       Container(
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
@@ -1348,7 +1488,7 @@ class _HeroCards extends StatelessWidget {
             Container(
                 padding: const EdgeInsets.all(7),
                 decoration: BoxDecoration(
-                    color: AppColors.info.withOpacity(0.12),
+                    color: AppColors.infoLight,
                     borderRadius: BorderRadius.circular(AppRadius.sm)),
                 child: const Icon(Icons.shield_outlined,
                     color: AppColors.info, size: 16)),
@@ -1379,6 +1519,18 @@ class _HeroCards extends StatelessWidget {
     ]);
   }
 
+  Widget _mini(String v, String l, Color c, ThemeController t) => Expanded(
+          child: Column(children: [
+        Text(v,
+            style:
+                AppTextStyles.numericMedium.copyWith(color: c, fontSize: 20)),
+        const SizedBox(height: 2),
+        Text(l,
+            style:
+                AppTextStyles.caption.copyWith(color: t.textSec, fontSize: 10),
+            textAlign: TextAlign.center),
+      ]));
+
   Widget _dot(Color color, String label) =>
       Row(mainAxisSize: MainAxisSize.min, children: [
         Container(
@@ -1400,148 +1552,40 @@ class _HeroCards extends StatelessWidget {
       child: Text(l, style: AppTextStyles.caption.copyWith(color: t.textSec)));
 }
 
-/// Consistent stat tile inside the pipeline hero card.
-/// Uses a tinted background derived from the accent colour so each pipeline
-/// status is distinct but stays within the same card vocabulary.
-class _PipelineStat extends StatelessWidget {
-  final String value;
-  final String label;
-  final Color color;
-  final ThemeController t;
-  const _PipelineStat({
-    required this.value,
-    required this.label,
-    required this.color,
-    required this.t,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.06),
-        borderRadius: BorderRadius.circular(AppRadius.md),
-        border: Border.all(color: color.withOpacity(0.18)),
-      ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(value,
-            style: AppTextStyles.numericMedium.copyWith(
-                color: color, fontSize: 20, fontWeight: FontWeight.w700)),
-        const SizedBox(height: 2),
-        Text(label,
-            style:
-                AppTextStyles.caption.copyWith(color: t.textSec, fontSize: 10)),
-      ]),
-    );
-  }
-}
-
-// ── Recent Onboarding Section ──────────────────────────────────────────────────
-class _RecentOnboardingSection extends StatelessWidget {
-  final DashboardController ctrl;
-  const _RecentOnboardingSection({required this.ctrl});
-
-  @override
-  Widget build(BuildContext context) {
-    final t = ThemeController.to;
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-          color: t.surface,
-          borderRadius: BorderRadius.circular(AppRadius.lg),
-          border: Border.all(color: t.border),
-          boxShadow: t.cardShadow),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          Text('Recent Onboarding',
-              style: AppTextStyles.headingSmall.copyWith(color: t.textPrimary)),
-          const Spacer(),
-          Text('${ctrl.recentOnboarding.length} records',
-              style: AppTextStyles.caption.copyWith(color: t.textTert)),
-        ]),
-        const SizedBox(height: 12),
-        ...ctrl.recentOnboarding.map((e) => Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Row(children: [
-                CircleAvatar(
-                    radius: 16,
-                    backgroundColor: AppColors.accent.withOpacity(0.12),
-                    child: Text(
-                        e.name.isNotEmpty ? e.name[0].toUpperCase() : '?',
-                        style: AppTextStyles.caption.copyWith(
-                            color: AppColors.accent,
-                            fontWeight: FontWeight.w700))),
-                const SizedBox(width: 10),
-                Expanded(
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                      Text(e.name,
-                          style: AppTextStyles.bodySmall.copyWith(
-                              color: t.textPrimary,
-                              fontWeight: FontWeight.w600)),
-                      Text('ID: ${e.employeeId}',
-                          style: AppTextStyles.caption
-                              .copyWith(color: t.textTert, fontSize: 10)),
-                    ])),
-                StatusBadge(status: e.status),
-              ]),
-            )),
-      ]),
-    );
-  }
-}
-
-// ── Pending Approvals Tile ─────────────────────────────────────────────────────
-// Consistent with the card system: surface background + coloured border accent
-// instead of a solid warning background. Tapping navigates to the Approvals tab.
+// ── Pending Tile ───────────────────────────────────────────────────────────────
 class _PendingTile extends StatelessWidget {
   final DashboardController ctrl;
   const _PendingTile({required this.ctrl});
 
   @override
   Widget build(BuildContext context) {
-    final t = ThemeController.to;
-    return GestureDetector(
-      onTap: () => TabSwitcher.switchTo(3),
-      child: Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-            color: t.surface,
-            borderRadius: BorderRadius.circular(AppRadius.lg),
-            border: Border.all(color: AppColors.warning.withOpacity(0.4)),
-            boxShadow: t.cardShadow),
-        child: Row(children: [
-          Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: AppColors.warning.withOpacity(0.12),
-              borderRadius: BorderRadius.circular(AppRadius.md),
-            ),
-            child: const Icon(Icons.hourglass_top_rounded,
-                color: AppColors.warning, size: 20),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                Text('My Pending Approvals',
-                    style: AppTextStyles.headingSmall
-                        .copyWith(color: t.textPrimary)),
-                Text(
-                    '${ctrl.pendingApprovals.length} hire${ctrl.pendingApprovals.length == 1 ? '' : 's'} awaiting your action',
-                    style: AppTextStyles.caption.copyWith(color: t.textSec)),
-              ])),
-          Text('Review',
-              style: AppTextStyles.buttonMedium
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+          color: AppColors.warningLight,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: AppColors.warning.withOpacity(0.3))),
+      child: Row(children: [
+        const Icon(Icons.hourglass_top_rounded,
+            color: AppColors.warning, size: 22),
+        const SizedBox(width: 12),
+        Expanded(
+            child:
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('My Pending Approvals',
+              style: AppTextStyles.headingSmall
                   .copyWith(color: AppColors.warning)),
-          const SizedBox(width: 4),
-          const Icon(Icons.arrow_forward_ios_rounded,
-              size: 12, color: AppColors.warning),
-        ]),
-      ),
+          Text(
+              '${ctrl.pendingApprovals.length} hire${ctrl.pendingApprovals.length == 1 ? '' : 's'} awaiting your action',
+              style: AppTextStyles.caption),
+        ])),
+        Text('Review',
+            style:
+                AppTextStyles.buttonMedium.copyWith(color: AppColors.warning)),
+        const SizedBox(width: 4),
+        const Icon(Icons.arrow_forward_ios_rounded,
+            size: 12, color: AppColors.warning),
+      ]),
     );
   }
 }
@@ -1571,15 +1615,26 @@ class AttendancePage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ctrl = Get.find<AttendanceController>();
-    return Obx(() {
-      final t = ThemeController.to;
-      return Scaffold(
-        backgroundColor: t.bg,
-        appBar: SharedAppBar(
-          title: 'Attendance',
-          subtitle: _buildSubtitle(ctrl),
-        ),
-        body: SingleChildScrollView(
+    final t = ThemeController.to;
+    return Scaffold(
+      backgroundColor: t.bg,
+      appBar: SharedAppBar(
+        title: 'Attendance',
+        subtitle: _buildSubtitle(ctrl),
+        extraActions: [
+          IconButton(
+            icon: Icon(Icons.refresh_rounded, color: t.textSec, size: 20),
+            onPressed: ctrl.fetchTodayStatus,
+          ),
+        ],
+      ),
+      // Pull-to-refresh re-reads today's punch state from the server.
+      body: RefreshIndicator(
+        onRefresh: ctrl.fetchTodayStatus,
+        color: AppColors.accent,
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(
+              parent: BouncingScrollPhysics()),
           padding: const EdgeInsets.all(16),
           child: Column(children: [
             _ClockCard(ctrl: ctrl, days: _days, months: _months),
@@ -1710,8 +1765,8 @@ class AttendancePage extends StatelessWidget {
             const SizedBox(height: 24),
           ]),
         ),
-      );
-    });
+      ),
+    );
   }
 
   String _buildSubtitle(AttendanceController ctrl) {
@@ -1747,6 +1802,7 @@ class _ClockCard extends StatelessWidget {
       final sec = now.second.toString().padLeft(2, '0');
       final ampm = now.hour >= 12 ? 'PM' : 'AM';
       final chk = ctrl.isCheckedIn.value;
+      final done = ctrl.hasCheckedOut;
       return Container(
         width: double.infinity,
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 28),
@@ -1756,10 +1812,15 @@ class _ClockCard extends StatelessWidget {
                   colors: [Color(0xFF065F46), Color(0xFF059669)],
                   begin: Alignment.topLeft,
                   end: Alignment.bottomRight)
-              : const LinearGradient(
-                  colors: [Color(0xFF1E293B), Color(0xFF312E81)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight),
+              : done
+                  ? const LinearGradient(
+                      colors: [Color(0xFF1E3A5F), Color(0xFF0E7490)],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight)
+                  : const LinearGradient(
+                      colors: [Color(0xFF1E293B), Color(0xFF312E81)],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight),
           borderRadius: BorderRadius.circular(24),
           boxShadow: [
             BoxShadow(
@@ -1782,10 +1843,17 @@ class _ClockCard extends StatelessWidget {
                   decoration: BoxDecoration(
                       color: chk
                           ? const Color(0xFF6EE7B7)
-                          : const Color(0xFF94A3B8),
+                          : done
+                              ? const Color(0xFF67E8F9)
+                              : const Color(0xFF94A3B8),
                       shape: BoxShape.circle)),
               const SizedBox(width: 6),
-              Text(chk ? 'Checked In' : 'Not Checked In',
+              Text(
+                  chk
+                      ? 'Checked In'
+                      : done
+                          ? 'Checked Out'
+                          : 'Not Checked In',
                   style: const TextStyle(
                       color: Colors.white,
                       fontSize: 12,
@@ -1857,24 +1925,49 @@ class _CheckButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return Obx(() {
       final chk = ctrl.isCheckedIn.value;
+      final done = ctrl.hasCheckedOut;
       final punching = ctrl.isPunching.value;
+
+      // Once the day is closed the button is disabled — previously it flipped
+      // back to "Check In", which let the user punch in twice in one day.
+      final VoidCallback? action =
+          (punching || done) ? null : (chk ? ctrl.checkOut : ctrl.checkIn);
+
+      final LinearGradient gradient = done
+          ? const LinearGradient(colors: [Color(0xFF94A3B8), Color(0xFF64748B)])
+          : chk
+              ? const LinearGradient(
+                  colors: [Color(0xFFDC2626), Color(0xFFB91C1C)])
+              : const LinearGradient(
+                  colors: [Color(0xFF059669), Color(0xFF047857)]);
+
+      final Color glow = done
+          ? AppColors.textTertiary
+          : chk
+              ? AppColors.danger
+              : AppColors.success;
+
+      final IconData icon = done
+          ? Icons.check_circle_rounded
+          : chk
+              ? Icons.logout_rounded
+              : Icons.login_rounded;
+
+      final String label =
+          done ? 'Checked Out' : (chk ? 'Check Out' : 'Check In');
+
       return GestureDetector(
-        onTap: punching ? null : (chk ? ctrl.checkOut : ctrl.checkIn),
+        onTap: action,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 250),
           width: double.infinity,
           height: 58,
           decoration: BoxDecoration(
-            gradient: chk
-                ? const LinearGradient(
-                    colors: [Color(0xFFDC2626), Color(0xFFB91C1C)])
-                : const LinearGradient(
-                    colors: [Color(0xFF059669), Color(0xFF047857)]),
+            gradient: gradient,
             borderRadius: BorderRadius.circular(16),
             boxShadow: [
               BoxShadow(
-                  color: (chk ? AppColors.danger : AppColors.success)
-                      .withOpacity(0.35),
+                  color: glow.withOpacity(done ? 0.18 : 0.35),
                   blurRadius: 16,
                   offset: const Offset(0, 6))
             ],
@@ -1888,10 +1981,9 @@ class _CheckButton extends StatelessWidget {
                           strokeWidth: 2.5,
                           valueColor: AlwaysStoppedAnimation(Colors.white))))
               : Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                  Icon(chk ? Icons.logout_rounded : Icons.login_rounded,
-                      color: Colors.white, size: 22),
+                  Icon(icon, color: Colors.white, size: 22),
                   const SizedBox(width: 10),
-                  Text(chk ? 'Check Out' : 'Check In',
+                  Text(label,
                       style: const TextStyle(
                           color: Colors.white,
                           fontSize: 17,
@@ -1979,15 +2071,15 @@ class _WeekDay extends StatelessWidget {
     Color bg, fg;
     switch (status) {
       case 'present':
-        bg = AppColors.success.withOpacity(0.12);
+        bg = AppColors.successLight;
         fg = AppColors.success;
         break;
       case 'today':
-        bg = AppColors.accent.withOpacity(0.12);
+        bg = AppColors.accentLight;
         fg = AppColors.accent;
         break;
       case 'absent':
-        bg = AppColors.danger.withOpacity(0.12);
+        bg = AppColors.dangerLight;
         fg = AppColors.danger;
         break;
       default:
@@ -2013,44 +2105,5 @@ class _WeekDay extends StatelessWidget {
       const SizedBox(height: 5),
       Text(day, style: AppTextStyles.caption.copyWith(fontSize: 10, color: fg)),
     ]);
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MY REQUESTS PLACEHOLDER
-// ═══════════════════════════════════════════════════════════════════════════════
-class _SubmissionsPage extends StatelessWidget {
-  const _SubmissionsPage();
-
-  @override
-  Widget build(BuildContext context) {
-    return Obx(() {
-      final t = ThemeController.to;
-      return Scaffold(
-        backgroundColor: t.bg,
-        appBar: SharedAppBar(title: 'My Requests'),
-        body: Center(
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Container(
-              width: 72,
-              height: 72,
-              decoration: BoxDecoration(
-                  color: AppColors.accent.withOpacity(0.12),
-                  borderRadius: BorderRadius.circular(AppRadius.xl)),
-              child: const Icon(Icons.assignment_outlined,
-                  color: AppColors.accent, size: 32),
-            ),
-            const SizedBox(height: 16),
-            Text('My Submissions',
-                style:
-                    AppTextStyles.headingMedium.copyWith(color: t.textPrimary)),
-            const SizedBox(height: 8),
-            Text('Hires you raised and their approval status.',
-                style: AppTextStyles.bodySmall.copyWith(color: t.textSec),
-                textAlign: TextAlign.center),
-          ]),
-        ),
-      );
-    });
   }
 }
