@@ -8,6 +8,7 @@ import 'package:shimmer/shimmer.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/network/api_client.dart';
 import '../../../../shared/widgets/shared_widgets.dart';
+import '../../data/employee_api.dart';
 import '../controllers/dashboard_controller.dart';
 import 'add_employee_page.dart';
 import 'approvals_page.dart';
@@ -70,6 +71,10 @@ class AttendanceController extends GetxController {
   // punch-in / punch-out and the ledger all need the logged-in employee's id.
   // Order: cached -> secure storage (written at login) -> JWT claim ->
   // first row of /employees/list (that row is the logged-in user).
+  /// Public wrapper so MyAttendanceController can reuse the same resolution
+  /// cascade instead of duplicating it.
+  Future<int?> resolveEmployeeId() => _resolveEmployeeId();
+
   Future<int?> _resolveEmployeeId() async {
     if (employeeId.value != null) return employeeId.value;
 
@@ -1593,6 +1598,245 @@ class _PendingTile extends StatelessWidget {
 // ═══════════════════════════════════════════════════════════════════════════════
 // ATTENDANCE PAGE
 // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// MY ATTENDANCE — month ledger + monthly summary
+// Mirrors the web portal's AttendanceCalendarPage: month nav (12 months of
+// history, no future months), a Sun–Sat grid coloured by status, and a
+// summary row driven by /monthly-summary.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// One normalised calendar day from GET /attendance/ledger.
+class LedgerDay {
+  final DateTime date;
+  final bool recorded;
+
+  /// PRESENT | ABSENT | LATE | HALF_DAY | ON_LEAVE | HOLIDAY
+  /// | WEEK_OFF | FUTURE | NO_RECORD
+  final String status;
+
+  /// Raw attendance record — present only when [recorded] is true.
+  final Map<String, dynamic>? day;
+
+  const LedgerDay({
+    required this.date,
+    required this.recorded,
+    required this.status,
+    this.day,
+  });
+
+  factory LedgerDay.fromJson(Map<String, dynamic> j) {
+    final parsed = DateTime.tryParse((j['date'] ?? '').toString());
+    final rec = j['recorded'] == true;
+    final raw = j['day'];
+    final dayMap = raw is Map ? Map<String, dynamic>.from(raw) : null;
+    return LedgerDay(
+      date: parsed ?? DateTime.now(),
+      recorded: rec,
+      status: _derive(rec, dayMap, j['derivedStatus']),
+      day: dayMap,
+    );
+  }
+
+  // When a record exists the real status wins, but isHalfDay / isLate are
+  // surfaced as their own states (the backend keeps status = PRESENT and
+  // flags them separately, exactly like the web's summary counts them).
+  static String _derive(
+      bool recorded, Map<String, dynamic>? day, dynamic derived) {
+    if (recorded && day != null) {
+      if (day['isHalfDay'] == true) return 'HALF_DAY';
+      if (day['isLate'] == true) return 'LATE';
+      final s = (day['status'] ?? '').toString();
+      return s.isNotEmpty ? s : 'PRESENT';
+    }
+    final d = (derived ?? '').toString();
+    return d.isNotEmpty ? d : 'NO_RECORD';
+  }
+
+  // ── Derived display helpers ─────────────────────────────────────────────
+  String? get punchInIst =>
+      day?['punchInTimeIST']?.toString() ?? day?['punchInTime']?.toString();
+  String? get punchOutIst =>
+      day?['punchOutTimeIST']?.toString() ?? day?['punchOutTime']?.toString();
+  int get workingMinutes => (day?['workingMinutes'] as num?)?.toInt() ?? 0;
+  int get overtimeMinutes => (day?['overtimeMinutes'] as num?)?.toInt() ?? 0;
+}
+
+class MyAttendanceController extends GetxController {
+  final _api = EmployeeApi();
+
+  final loading = false.obs;
+  final summaryLoading = false.obs;
+  final error = ''.obs;
+  final ledger = <LedgerDay>[].obs;
+  final summary = Rxn<Map<String, dynamic>>();
+
+  /// First day of the month currently being viewed.
+  final activeMonth = DateTime(DateTime.now().year, DateTime.now().month).obs;
+
+  /// Matches the web's MAX_HISTORY_MONTHS.
+  static const int maxHistoryMonths = 12;
+
+  int get year => activeMonth.value.year;
+  int get month => activeMonth.value.month;
+
+  DateTime get _thisMonth =>
+      DateTime(DateTime.now().year, DateTime.now().month);
+
+  bool get canGoNext => activeMonth.value.isBefore(_thisMonth);
+  bool get canGoPrev {
+    final earliest =
+        DateTime(_thisMonth.year, _thisMonth.month - maxHistoryMonths);
+    final prev = DateTime(year, month - 1);
+    return !prev.isBefore(earliest);
+  }
+
+  @override
+  void onInit() {
+    super.onInit();
+    load();
+  }
+
+  void nextMonth() {
+    if (!canGoNext) return;
+    activeMonth.value = DateTime(year, month + 1);
+    load();
+  }
+
+  void prevMonth() {
+    if (!canGoPrev) return;
+    activeMonth.value = DateTime(year, month - 1);
+    load();
+  }
+
+  Future<void> load() async {
+    loading.value = true;
+    summaryLoading.value = true;
+    error.value = '';
+
+    // Reuse the punch controller's proven employee-id cascade
+    // (storage -> JWT claim -> first row of /employees/list).
+    int? empId;
+    if (Get.isRegistered<AttendanceController>()) {
+      empId = await Get.find<AttendanceController>().resolveEmployeeId();
+    }
+    if (empId == null) {
+      error.value = 'Could not identify the logged-in employee.';
+      ledger.clear();
+      summary.value = null;
+      loading.value = false;
+      summaryLoading.value = false;
+      return;
+    }
+
+    final first = DateTime(year, month, 1);
+    final last = DateTime(year, month + 1, 0); // day 0 of next month
+    final from = DateFormat('yyyy-MM-dd').format(first);
+    final to = DateFormat('yyyy-MM-dd').format(last);
+
+    try {
+      final rows =
+          await _api.getAttendanceLedger(employeeId: empId, from: from, to: to);
+      ledger.assignAll(rows
+          .whereType<Map>()
+          .map((e) => LedgerDay.fromJson(Map<String, dynamic>.from(e)))
+          .toList());
+    } on DioException catch (e) {
+      error.value = ApiFailure.fromDioException(e).message;
+      ledger.clear();
+    } catch (e) {
+      error.value = 'Failed to load attendance: $e';
+      ledger.clear();
+    } finally {
+      loading.value = false;
+    }
+
+    // Summary is best-effort — the grid stays usable if it fails.
+    try {
+      summary.value = await _api.getMonthlySummary(empId, month, year);
+    } catch (_) {
+      summary.value = null;
+    } finally {
+      summaryLoading.value = false;
+    }
+  }
+
+  /// Counts for the summary row. Prefers /monthly-summary (what the web
+  /// shows) and falls back to counting the ledger when it isn't available.
+  Map<String, int> get counts {
+    final s = summary.value;
+    if (s != null) {
+      int n(String k) => (s[k] as num?)?.toInt() ?? 0;
+      return {
+        'present': n('presentDays'),
+        'absent': n('absentDays'),
+        'late': n('lateDays'),
+        'leave': n('leavesTaken'),
+        'halfDay': n('halfDays'),
+      };
+    }
+    final c = {'present': 0, 'absent': 0, 'late': 0, 'leave': 0, 'halfDay': 0};
+    for (final d in ledger) {
+      switch (d.status) {
+        case 'PRESENT':
+          c['present'] = c['present']! + 1;
+          break;
+        case 'ABSENT':
+          c['absent'] = c['absent']! + 1;
+          break;
+        case 'LATE':
+          c['late'] = c['late']! + 1;
+          break;
+        case 'ON_LEAVE':
+        case 'LEAVE':
+          c['leave'] = c['leave']! + 1;
+          break;
+        case 'HALF_DAY':
+          c['halfDay'] = c['halfDay']! + 1;
+          break;
+      }
+    }
+    return c;
+  }
+
+  String summaryText(String key) {
+    final v = summary.value?[key];
+    if (v == null) return '—';
+    return v.toString();
+  }
+}
+
+// ── Status -> colour / label, shared by the grid, legend and detail sheet ──
+class AttendanceStatusStyle {
+  final Color color;
+  final String label;
+  const AttendanceStatusStyle(this.color, this.label);
+
+  static AttendanceStatusStyle of(String status) {
+    switch (status) {
+      case 'PRESENT':
+        return const AttendanceStatusStyle(AppColors.success, 'Present');
+      case 'ABSENT':
+        return const AttendanceStatusStyle(AppColors.danger, 'Absent');
+      case 'LATE':
+        return const AttendanceStatusStyle(AppColors.warning, 'Late');
+      case 'HALF_DAY':
+        return const AttendanceStatusStyle(AppColors.info, 'Half Day');
+      case 'ON_LEAVE':
+      case 'LEAVE':
+        return const AttendanceStatusStyle(AppColors.accent, 'On Leave');
+      case 'HOLIDAY':
+        return const AttendanceStatusStyle(Color(0xFF7C3AED), 'Holiday');
+      case 'WEEK_OFF':
+      case 'WEEKEND':
+        return const AttendanceStatusStyle(AppColors.textTertiary, 'Week Off');
+      case 'FUTURE':
+        return const AttendanceStatusStyle(AppColors.textTertiary, '—');
+      default: // NO_RECORD
+        return const AttendanceStatusStyle(AppColors.textTertiary, 'No Record');
+    }
+  }
+}
+
 class AttendancePage extends StatelessWidget {
   const AttendancePage({super.key});
 
@@ -1616,155 +1860,32 @@ class AttendancePage extends StatelessWidget {
   Widget build(BuildContext context) {
     final ctrl = Get.find<AttendanceController>();
     final t = ThemeController.to;
-    return Scaffold(
-      backgroundColor: t.bg,
-      appBar: SharedAppBar(
-        title: 'Attendance',
-        subtitle: _buildSubtitle(ctrl),
-        extraActions: [
-          IconButton(
-            icon: Icon(Icons.refresh_rounded, color: t.textSec, size: 20),
-            onPressed: ctrl.fetchTodayStatus,
+    // Two sections, as separate tabs: My Attendance (month ledger) and
+    // Check In / Out (the existing punch flow, unchanged).
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        backgroundColor: t.bg,
+        appBar: SharedAppBar(
+          title: 'Attendance',
+          subtitle: _buildSubtitle(ctrl),
+          bottom: TabBar(
+            labelColor: AppColors.accent,
+            unselectedLabelColor: t.textSec,
+            indicatorColor: AppColors.accent,
+            indicatorWeight: 2.5,
+            labelStyle: AppTextStyles.buttonMedium,
+            unselectedLabelStyle: AppTextStyles.buttonMedium,
+            tabs: const [
+              Tab(text: 'My Attendance'),
+              Tab(text: 'Check In / Out'),
+            ],
           ),
-        ],
-      ),
-      // Pull-to-refresh re-reads today's punch state from the server.
-      body: RefreshIndicator(
-        onRefresh: ctrl.fetchTodayStatus,
-        color: AppColors.accent,
-        child: SingleChildScrollView(
-          physics: const AlwaysScrollableScrollPhysics(
-              parent: BouncingScrollPhysics()),
-          padding: const EdgeInsets.all(16),
-          child: Column(children: [
-            _ClockCard(ctrl: ctrl, days: _days, months: _months),
-            const SizedBox(height: 16),
-            Obx(() => Row(children: [
-                  Expanded(
-                      child: _TimeTile(
-                          label: 'Check In',
-                          time: ctrl.checkInDisplay,
-                          icon: Icons.login_rounded,
-                          color: AppColors.success,
-                          active: ctrl.checkInTime.value != null,
-                          t: t)),
-                  const SizedBox(width: 12),
-                  Expanded(
-                      child: _TimeTile(
-                          label: 'Check Out',
-                          time: ctrl.checkOutDisplay,
-                          icon: Icons.logout_rounded,
-                          color: AppColors.danger,
-                          active: ctrl.checkOutTime.value != null,
-                          t: t)),
-                ])),
-            const SizedBox(height: 16),
-            _CheckButton(ctrl: ctrl),
-            const SizedBox(height: 20),
-            Obx(() {
-              final now = ctrl.currentTime.value;
-              return Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                    color: t.surface,
-                    borderRadius: BorderRadius.circular(AppRadius.lg),
-                    border: Border.all(color: t.border),
-                    boxShadow: t.cardShadow),
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(children: [
-                        Text("Today's Summary",
-                            style: AppTextStyles.headingSmall
-                                .copyWith(color: t.textPrimary)),
-                        const Spacer(),
-                        Text('${now.day}/${now.month}/${now.year}',
-                            style: AppTextStyles.caption
-                                .copyWith(color: t.textTert)),
-                      ]),
-                      const SizedBox(height: 16),
-                      Row(children: [
-                        _SummaryStat(
-                            label: 'Status',
-                            value: ctrl.isCheckedIn.value
-                                ? 'Present'
-                                : ctrl.checkOutTime.value != null
-                                    ? 'Completed'
-                                    : 'Absent',
-                            color: ctrl.isCheckedIn.value
-                                ? AppColors.success
-                                : ctrl.checkOutTime.value != null
-                                    ? AppColors.info
-                                    : t.textTert,
-                            t: t),
-                        _SummaryStat(
-                            label: 'Check In',
-                            value: ctrl.checkInDisplay,
-                            color: AppColors.success,
-                            t: t),
-                        _SummaryStat(
-                            label: 'Check Out',
-                            value: ctrl.checkOutDisplay,
-                            color: AppColors.danger,
-                            t: t),
-                        _SummaryStat(
-                            label: 'Duration',
-                            value: ctrl.checkInTime.value != null
-                                ? ctrl.elapsedFormatted
-                                : '--:--:--',
-                            color: AppColors.accent,
-                            t: t),
-                      ]),
-                    ]),
-              );
-            }),
-            const SizedBox(height: 16),
-            Obx(() {
-              final now = ctrl.currentTime.value;
-              return Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                    color: t.surface,
-                    borderRadius: BorderRadius.circular(AppRadius.lg),
-                    border: Border.all(color: t.border),
-                    boxShadow: t.cardShadow),
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('This Week',
-                          style: AppTextStyles.headingSmall
-                              .copyWith(color: t.textPrimary)),
-                      const SizedBox(height: 14),
-                      Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            _WeekDay(day: 'Mon', status: 'present', t: t),
-                            _WeekDay(day: 'Tue', status: 'present', t: t),
-                            _WeekDay(day: 'Wed', status: 'present', t: t),
-                            _WeekDay(day: 'Thu', status: 'present', t: t),
-                            _WeekDay(
-                                day: 'Fri',
-                                status: ctrl.checkInTime.value != null
-                                    ? 'present'
-                                    : 'today',
-                                t: t),
-                            _WeekDay(day: 'Sat', status: 'weekend', t: t),
-                            _WeekDay(day: 'Sun', status: 'weekend', t: t),
-                          ]),
-                      const SizedBox(height: 14),
-                      Row(children: [
-                        _legend(t, AppColors.success, 'Present'),
-                        const SizedBox(width: 16),
-                        _legend(t, AppColors.accent, 'Today'),
-                        const SizedBox(width: 16),
-                        _legend(t, t.border, 'Weekend'),
-                      ]),
-                    ]),
-              );
-            }),
-            const SizedBox(height: 24),
-          ]),
         ),
+        body: TabBarView(children: [
+          const _MyAttendanceTab(),
+          _CheckInOutTab(ctrl: ctrl, days: _days, months: _months),
+        ]),
       ),
     );
   }
@@ -1772,6 +1893,158 @@ class AttendancePage extends StatelessWidget {
   String _buildSubtitle(AttendanceController ctrl) {
     final now = ctrl.currentTime.value;
     return '${_days[now.weekday - 1]}, ${now.day} ${_months[now.month - 1]} ${now.year}';
+  }
+}
+
+// ── Check In / Out tab — the existing punch flow, moved verbatim ─────────────
+class _CheckInOutTab extends StatelessWidget {
+  final AttendanceController ctrl;
+  final List<String> days;
+  final List<String> months;
+  const _CheckInOutTab(
+      {required this.ctrl, required this.days, required this.months});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = ThemeController.to;
+    // Pull-to-refresh re-reads today's punch state from the server.
+    return RefreshIndicator(
+      onRefresh: ctrl.fetchTodayStatus,
+      color: AppColors.accent,
+      child: SingleChildScrollView(
+        physics: const AlwaysScrollableScrollPhysics(
+            parent: BouncingScrollPhysics()),
+        padding: const EdgeInsets.all(16),
+        child: Column(children: [
+          _ClockCard(ctrl: ctrl, days: days, months: months),
+          const SizedBox(height: 16),
+          Obx(() => Row(children: [
+                Expanded(
+                    child: _TimeTile(
+                        label: 'Check In',
+                        time: ctrl.checkInDisplay,
+                        icon: Icons.login_rounded,
+                        color: AppColors.success,
+                        active: ctrl.checkInTime.value != null,
+                        t: t)),
+                const SizedBox(width: 12),
+                Expanded(
+                    child: _TimeTile(
+                        label: 'Check Out',
+                        time: ctrl.checkOutDisplay,
+                        icon: Icons.logout_rounded,
+                        color: AppColors.danger,
+                        active: ctrl.checkOutTime.value != null,
+                        t: t)),
+              ])),
+          const SizedBox(height: 16),
+          _CheckButton(ctrl: ctrl),
+          const SizedBox(height: 20),
+          Obx(() {
+            final now = ctrl.currentTime.value;
+            return Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                  color: t.surface,
+                  borderRadius: BorderRadius.circular(AppRadius.lg),
+                  border: Border.all(color: t.border),
+                  boxShadow: t.cardShadow),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(children: [
+                      Text("Today's Summary",
+                          style: AppTextStyles.headingSmall
+                              .copyWith(color: t.textPrimary)),
+                      const Spacer(),
+                      Text('${now.day}/${now.month}/${now.year}',
+                          style: AppTextStyles.caption
+                              .copyWith(color: t.textTert)),
+                    ]),
+                    const SizedBox(height: 16),
+                    Row(children: [
+                      _SummaryStat(
+                          label: 'Status',
+                          value: ctrl.isCheckedIn.value
+                              ? 'Present'
+                              : ctrl.checkOutTime.value != null
+                                  ? 'Completed'
+                                  : 'Absent',
+                          color: ctrl.isCheckedIn.value
+                              ? AppColors.success
+                              : ctrl.checkOutTime.value != null
+                                  ? AppColors.info
+                                  : t.textTert,
+                          t: t),
+                      _SummaryStat(
+                          label: 'Check In',
+                          value: ctrl.checkInDisplay,
+                          color: AppColors.success,
+                          t: t),
+                      _SummaryStat(
+                          label: 'Check Out',
+                          value: ctrl.checkOutDisplay,
+                          color: AppColors.danger,
+                          t: t),
+                      _SummaryStat(
+                          label: 'Duration',
+                          value: ctrl.checkInTime.value != null
+                              ? ctrl.elapsedFormatted
+                              : '--:--:--',
+                          color: AppColors.accent,
+                          t: t),
+                    ]),
+                  ]),
+            );
+          }),
+          const SizedBox(height: 16),
+          Obx(() {
+            final now = ctrl.currentTime.value;
+            return Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                  color: t.surface,
+                  borderRadius: BorderRadius.circular(AppRadius.lg),
+                  border: Border.all(color: t.border),
+                  boxShadow: t.cardShadow),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('This Week',
+                        style: AppTextStyles.headingSmall
+                            .copyWith(color: t.textPrimary)),
+                    const SizedBox(height: 14),
+                    Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          _WeekDay(day: 'Mon', status: 'present', t: t),
+                          _WeekDay(day: 'Tue', status: 'present', t: t),
+                          _WeekDay(day: 'Wed', status: 'present', t: t),
+                          _WeekDay(day: 'Thu', status: 'present', t: t),
+                          _WeekDay(
+                              day: 'Fri',
+                              status: ctrl.checkInTime.value != null
+                                  ? 'present'
+                                  : 'today',
+                              t: t),
+                          _WeekDay(day: 'Sat', status: 'weekend', t: t),
+                          _WeekDay(day: 'Sun', status: 'weekend', t: t),
+                        ]),
+                    const SizedBox(height: 14),
+                    Row(children: [
+                      _legend(t, AppColors.success, 'Present'),
+                      const SizedBox(width: 16),
+                      _legend(t, AppColors.accent, 'Today'),
+                      const SizedBox(width: 16),
+                      _legend(t, t.border, 'Weekend'),
+                    ]),
+                  ]),
+            );
+          }),
+          const SizedBox(height: 24),
+        ]),
+      ),
+    );
   }
 
   Widget _legend(ThemeController t, Color color, String label) =>
@@ -2105,5 +2378,465 @@ class _WeekDay extends StatelessWidget {
       const SizedBox(height: 5),
       Text(day, style: AppTextStyles.caption.copyWith(fontSize: 10, color: fg)),
     ]);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MY ATTENDANCE TAB — month nav + calendar grid + legend + monthly summary
+// ═══════════════════════════════════════════════════════════════════════════════
+class _MyAttendanceTab extends StatelessWidget {
+  const _MyAttendanceTab();
+
+  static const _monthNames = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December'
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    // isRegistered guard: TabBarView rebuilds this widget, and a bare
+    // Get.put would replace the controller and re-run onInit (refetching)
+    // every time the tab is rebuilt.
+    final ctrl = Get.isRegistered<MyAttendanceController>()
+        ? Get.find<MyAttendanceController>()
+        : Get.put(MyAttendanceController());
+    final t = ThemeController.to;
+
+    return RefreshIndicator(
+      onRefresh: ctrl.load,
+      color: AppColors.accent,
+      child: SingleChildScrollView(
+        physics: const AlwaysScrollableScrollPhysics(
+            parent: BouncingScrollPhysics()),
+        padding: const EdgeInsets.all(16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // ── Month navigation ──────────────────────────────────────────
+          Obx(() => Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                decoration: BoxDecoration(
+                    color: t.surface,
+                    borderRadius: BorderRadius.circular(AppRadius.lg),
+                    border: Border.all(color: t.border),
+                    boxShadow: t.cardShadow),
+                child: Row(children: [
+                  _navBtn(
+                      icon: Icons.chevron_left_rounded,
+                      enabled: ctrl.canGoPrev,
+                      onTap: ctrl.prevMonth,
+                      t: t),
+                  Expanded(
+                    child: Text(
+                      '${_monthNames[ctrl.month - 1]} ${ctrl.year}',
+                      textAlign: TextAlign.center,
+                      style: AppTextStyles.headingSmall
+                          .copyWith(color: t.textPrimary),
+                    ),
+                  ),
+                  _navBtn(
+                      icon: Icons.chevron_right_rounded,
+                      enabled: ctrl.canGoNext,
+                      onTap: ctrl.nextMonth,
+                      t: t),
+                ]),
+              )),
+          const SizedBox(height: 14),
+
+          // ── Calendar grid ─────────────────────────────────────────────
+          Obx(() {
+            if (ctrl.loading.value) {
+              return _calendarSkeleton(t);
+            }
+            if (ctrl.error.value.isNotEmpty && ctrl.ledger.isEmpty) {
+              return Container(
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                    color: t.surface,
+                    borderRadius: BorderRadius.circular(AppRadius.lg),
+                    border: Border.all(color: t.border)),
+                child: Column(children: [
+                  const Icon(Icons.error_outline_rounded,
+                      color: AppColors.danger, size: 40),
+                  const SizedBox(height: 10),
+                  Text(ctrl.error.value,
+                      textAlign: TextAlign.center,
+                      style:
+                          AppTextStyles.bodySmall.copyWith(color: t.textSec)),
+                  const SizedBox(height: 12),
+                  ElevatedButton(
+                      onPressed: ctrl.load, child: const Text('Retry')),
+                ]),
+              );
+            }
+            return _AttendanceCalendarGrid(
+                ctrl: ctrl, year: ctrl.year, month: ctrl.month, t: t);
+          }),
+          const SizedBox(height: 14),
+
+          // ── Legend ────────────────────────────────────────────────────
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+                color: t.surface,
+                borderRadius: BorderRadius.circular(AppRadius.lg),
+                border: Border.all(color: t.border)),
+            child: Wrap(spacing: 14, runSpacing: 8, children: const [
+              _LegendDot(status: 'PRESENT'),
+              _LegendDot(status: 'ABSENT'),
+              _LegendDot(status: 'LATE'),
+              _LegendDot(status: 'HALF_DAY'),
+              _LegendDot(status: 'ON_LEAVE'),
+              _LegendDot(status: 'HOLIDAY'),
+              _LegendDot(status: 'WEEK_OFF'),
+            ]),
+          ),
+          const SizedBox(height: 16),
+
+          // ── Monthly summary ───────────────────────────────────────────
+          Obx(() {
+            final c = ctrl.counts;
+            final busy = ctrl.summaryLoading.value;
+            return Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                  color: t.surface,
+                  borderRadius: BorderRadius.circular(AppRadius.lg),
+                  border: Border.all(color: t.border),
+                  boxShadow: t.cardShadow),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Monthly Summary',
+                        style: AppTextStyles.headingSmall
+                            .copyWith(color: t.textPrimary)),
+                    const SizedBox(height: 14),
+                    // Primary five — same metrics the web portal shows.
+                    Row(children: [
+                      _SummaryStat(
+                          label: 'Present',
+                          value: busy ? '—' : '${c['present']}',
+                          color: AppColors.success,
+                          t: t),
+                      _SummaryStat(
+                          label: 'Absent',
+                          value: busy ? '—' : '${c['absent']}',
+                          color: AppColors.danger,
+                          t: t),
+                      _SummaryStat(
+                          label: 'Late',
+                          value: busy ? '—' : '${c['late']}',
+                          color: AppColors.warning,
+                          t: t),
+                      _SummaryStat(
+                          label: 'Leave',
+                          value: busy ? '—' : '${c['leave']}',
+                          color: AppColors.accent,
+                          t: t),
+                      _SummaryStat(
+                          label: 'Half Day',
+                          value: busy ? '—' : '${c['halfDay']}',
+                          color: AppColors.info,
+                          t: t),
+                    ]),
+                    const SizedBox(height: 14),
+                    Divider(color: t.border, height: 1),
+                    const SizedBox(height: 14),
+                    // Secondary strip — the rest of the monthly-summary payload.
+                    Row(children: [
+                      _SummaryStat(
+                          label: 'Working Days',
+                          value:
+                              busy ? '—' : ctrl.summaryText('totalWorkingDays'),
+                          color: t.textPrimary,
+                          t: t),
+                      _SummaryStat(
+                          label: 'Paid Days',
+                          value: busy ? '—' : ctrl.summaryText('paidDays'),
+                          color: t.textPrimary,
+                          t: t),
+                      _SummaryStat(
+                          label: 'Payable',
+                          value: busy ? '—' : ctrl.summaryText('payableDays'),
+                          color: t.textPrimary,
+                          t: t),
+                      _SummaryStat(
+                          label: 'OT Hours',
+                          value: busy ? '—' : ctrl.summaryText('overtimeHours'),
+                          color: t.textPrimary,
+                          t: t),
+                      _SummaryStat(
+                          label: 'LOP',
+                          value: busy ? '—' : ctrl.summaryText('lopDays'),
+                          color: t.textPrimary,
+                          t: t),
+                    ]),
+                  ]),
+            );
+          }),
+          const SizedBox(height: 24),
+        ]),
+      ),
+    );
+  }
+
+  Widget _navBtn(
+      {required IconData icon,
+      required bool enabled,
+      required VoidCallback onTap,
+      required ThemeController t}) {
+    return IconButton(
+      onPressed: enabled ? onTap : null,
+      icon: Icon(icon,
+          size: 26,
+          color: enabled ? t.textPrimary : t.textTert.withOpacity(0.4)),
+      splashRadius: 22,
+    );
+  }
+
+  Widget _calendarSkeleton(ThemeController t) => Shimmer.fromColors(
+        baseColor: t.surface,
+        highlightColor: t.surfaceVar,
+        child: Container(
+          height: 320,
+          decoration: BoxDecoration(
+              color: t.surface,
+              borderRadius: BorderRadius.circular(AppRadius.lg)),
+        ),
+      );
+}
+
+// ── Legend chip ──────────────────────────────────────────────────────────────
+class _LegendDot extends StatelessWidget {
+  final String status;
+  const _LegendDot({required this.status});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = ThemeController.to;
+    final s = AttendanceStatusStyle.of(status);
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+              color: s.color, borderRadius: BorderRadius.circular(3))),
+      const SizedBox(width: 5),
+      Text(s.label,
+          style:
+              AppTextStyles.caption.copyWith(color: t.textSec, fontSize: 11)),
+    ]);
+  }
+}
+
+// ── Calendar grid (Sun–Sat, leading empties) ─────────────────────────────────
+class _AttendanceCalendarGrid extends StatelessWidget {
+  final MyAttendanceController ctrl;
+  final int year, month;
+  final ThemeController t;
+  const _AttendanceCalendarGrid(
+      {required this.ctrl,
+      required this.year,
+      required this.month,
+      required this.t});
+
+  static const _headers = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  @override
+  Widget build(BuildContext context) {
+    // O(1) lookup by day-of-month, same approach as the web grid.
+    final byDay = <int, LedgerDay>{};
+    for (final d in ctrl.ledger) {
+      byDay[d.date.day] = d;
+    }
+
+    final daysInMonth = DateTime(year, month + 1, 0).day;
+    // weekday: Mon=1..Sun=7 -> Sun=0..Sat=6 for a Sunday-first grid.
+    final leading = DateTime(year, month, 1).weekday % 7;
+
+    final now = DateTime.now();
+    final cells = <Widget>[];
+    for (var i = 0; i < leading; i++) {
+      cells.add(const SizedBox.shrink());
+    }
+    for (var d = 1; d <= daysInMonth; d++) {
+      final isToday = now.year == year && now.month == month && now.day == d;
+      cells.add(
+          _AttendanceDayCell(day: d, entry: byDay[d], isToday: isToday, t: t));
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+          color: t.surface,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: t.border),
+          boxShadow: t.cardShadow),
+      child: Column(children: [
+        Row(
+            children: _headers
+                .map((h) => Expanded(
+                      child: Center(
+                        child: Text(h,
+                            style: AppTextStyles.caption.copyWith(
+                                color: t.textTert,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600)),
+                      ),
+                    ))
+                .toList()),
+        const SizedBox(height: 8),
+        GridView.count(
+          crossAxisCount: 7,
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          mainAxisSpacing: 6,
+          crossAxisSpacing: 6,
+          children: cells,
+        ),
+      ]),
+    );
+  }
+}
+
+// ── One day square ───────────────────────────────────────────────────────────
+class _AttendanceDayCell extends StatelessWidget {
+  final int day;
+  final LedgerDay? entry;
+  final bool isToday;
+  final ThemeController t;
+  const _AttendanceDayCell(
+      {required this.day,
+      required this.entry,
+      required this.isToday,
+      required this.t});
+
+  @override
+  Widget build(BuildContext context) {
+    final status = entry?.status ?? 'NO_RECORD';
+    final isFuture = status == 'FUTURE';
+    final isBlank = status == 'NO_RECORD' || isFuture;
+    final s = AttendanceStatusStyle.of(status);
+
+    // Blank days (no record / future) get no fill — only recorded or
+    // explicitly-derived states are coloured, matching the web grid.
+    final bg = isBlank ? t.surfaceVar : s.color.withOpacity(0.14);
+    final fg = isFuture
+        ? t.textTert.withOpacity(0.5)
+        : isBlank
+            ? t.textSec
+            : s.color;
+
+    return GestureDetector(
+      onTap:
+          entry?.recorded == true ? () => _showDetail(context, entry!) : null,
+      child: Container(
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: isToday ? AppColors.accent : Colors.transparent,
+            width: isToday ? 2 : 0,
+          ),
+        ),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Text('$day',
+              style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: isToday ? FontWeight.w800 : FontWeight.w600,
+                  color: fg)),
+          if (!isBlank) ...[
+            const SizedBox(height: 2),
+            Container(
+                width: 14,
+                height: 3,
+                decoration: BoxDecoration(
+                    color: s.color, borderRadius: BorderRadius.circular(2))),
+          ],
+        ]),
+      ),
+    );
+  }
+
+  void _showDetail(BuildContext context, LedgerDay e) {
+    final t = ThemeController.to;
+    final s = AttendanceStatusStyle.of(e.status);
+    String fmt(String? iso) {
+      if (iso == null) return '--:--';
+      final d = DateTime.tryParse(iso)?.toLocal();
+      if (d == null) return '--:--';
+      final h12 =
+          (d.hour % 12 == 0 ? 12 : d.hour % 12).toString().padLeft(2, '0');
+      return '$h12:${d.minute.toString().padLeft(2, '0')} '
+          '${d.hour >= 12 ? 'PM' : 'AM'}';
+    }
+
+    Widget row(String label, String value) => Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: Row(children: [
+            SizedBox(
+                width: 120,
+                child: Text(label,
+                    style: AppTextStyles.caption.copyWith(color: t.textTert))),
+            Expanded(
+                child: Text(value,
+                    style: AppTextStyles.bodySmall.copyWith(
+                        color: t.textPrimary, fontWeight: FontWeight.w500))),
+          ]),
+        );
+
+    Get.bottomSheet(
+      Container(
+        padding: EdgeInsets.fromLTRB(
+            20, 14, 20, 20 + MediaQuery.of(context).viewPadding.bottom),
+        decoration: BoxDecoration(
+            color: t.surface,
+            borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(24), topRight: Radius.circular(24))),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                  color: t.border, borderRadius: BorderRadius.circular(100))),
+          const SizedBox(height: 18),
+          Row(children: [
+            Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                    color: s.color.withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(AppRadius.full)),
+                child: Text(s.label,
+                    style: AppTextStyles.caption.copyWith(
+                        color: s.color, fontWeight: FontWeight.w700))),
+            const Spacer(),
+            Text(DateFormat('EEE, d MMM yyyy').format(e.date),
+                style: AppTextStyles.caption.copyWith(color: t.textSec)),
+          ]),
+          const SizedBox(height: 18),
+          row('Check In', fmt(e.punchInIst)),
+          row('Check Out', fmt(e.punchOutIst)),
+          row('Working Hours',
+              '${(e.workingMinutes ~/ 60)}h ${(e.workingMinutes % 60)}m'),
+          if (e.overtimeMinutes > 0)
+            row('Overtime',
+                '${(e.overtimeMinutes ~/ 60)}h ${(e.overtimeMinutes % 60)}m'),
+          if ((e.day?['punchInSource'] ?? '').toString().isNotEmpty)
+            row('Source', e.day!['punchInSource'].toString()),
+          if ((e.day?['remarks'] ?? '').toString().isNotEmpty)
+            row('Remarks', e.day!['remarks'].toString()),
+          const SizedBox(height: 4),
+        ]),
+      ),
+    );
   }
 }
