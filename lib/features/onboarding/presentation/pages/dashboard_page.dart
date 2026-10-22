@@ -2,11 +2,13 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:intl/intl.dart';
 import 'package:shimmer/shimmer.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/network/api_client.dart';
 import '../../../../shared/widgets/shared_widgets.dart';
+import '../../data/employee_api.dart';
 import '../controllers/dashboard_controller.dart';
 import 'add_employee_page.dart';
 import 'approvals_page.dart';
@@ -20,16 +22,34 @@ import 'profile_page.dart';
 // ATTENDANCE CONTROLLER — real API: punch-in/out + today status
 // ═══════════════════════════════════════════════════════════════════════════════
 class AttendanceController extends GetxController {
+  // Three-state model mirroring the web portal's CheckInOutPage:
+  //   NOT_CHECKED_IN -> CHECKED_IN -> CHECKED_OUT
+  // `isCheckedIn` is kept in sync so existing widgets keep working.
+  static const String statusNotIn = 'NOT_CHECKED_IN';
+  static const String statusIn = 'CHECKED_IN';
+  static const String statusOut = 'CHECKED_OUT';
+
+  final attendanceStatus = statusNotIn.obs;
   final isCheckedIn = false.obs;
   final checkInTime = Rxn<DateTime>();
   final checkOutTime = Rxn<DateTime>();
   final currentTime = DateTime.now().obs;
   final elapsedSecs = 0.obs;
   final isPunching = false.obs;
+  final isLoadingStatus = false.obs;
+  final employeeId = Rxn<int>();
   Timer? _clockTimer;
   Timer? _elapsedTimer;
 
+  // Punch source. 'WEB' is the only value proven against this backend — it is
+  // exactly what the working web portal sends. Change to 'MOBILE' only if the
+  // backend PunchSource enum accepts it.
+  static const String _punchSource = 'WEB';
+
   final Dio _dio = ApiClient.instance;
+  static const _storage = FlutterSecureStorage();
+
+  bool get hasCheckedOut => attendanceStatus.value == statusOut;
 
   @override
   void onInit() {
@@ -37,7 +57,7 @@ class AttendanceController extends GetxController {
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       currentTime.value = DateTime.now();
     });
-    _fetchTodayStatus();
+    fetchTodayStatus();
   }
 
   @override
@@ -47,9 +67,62 @@ class AttendanceController extends GetxController {
     super.onClose();
   }
 
-  Future<void> _fetchTodayStatus() async {
+  // ── Employee id resolution ────────────────────────────────────────────────
+  // punch-in / punch-out and the ledger all need the logged-in employee's id.
+  // Order: cached -> secure storage (written at login) -> JWT claim ->
+  // first row of /employees/list (that row is the logged-in user).
+  /// Public wrapper so MyAttendanceController can reuse the same resolution
+  /// cascade instead of duplicating it.
+  Future<int?> resolveEmployeeId() => _resolveEmployeeId();
+
+  Future<int?> _resolveEmployeeId() async {
+    if (employeeId.value != null) return employeeId.value;
+
+    final stored = await _storage.read(key: 'employee_id');
+    final fromStore = int.tryParse(stored ?? '');
+    if (fromStore != null) {
+      employeeId.value = fromStore;
+      return fromStore;
+    }
+
+    final token = await _storage.read(key: 'auth_token');
+    final fromJwt = ApiClient.getEmployeeIdFromToken(token);
+    if (fromJwt != null) {
+      employeeId.value = fromJwt;
+      return fromJwt;
+    }
+
     try {
-      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      // sortBy MUST be 'firstName' — 'fullName' makes this endpoint 500.
+      final res = await _dio.post('/api/v1/employees/list', data: {
+        'page': 0,
+        'size': 1,
+        'sortBy': 'firstName',
+        'sortDir': 'ASC',
+        'filters': {},
+      });
+      final list = res.data?['data'] as List?;
+      if (list != null && list.isNotEmpty) {
+        final raw = (list.first as Map)['employeeId'];
+        final parsed = raw is int ? raw : int.tryParse(raw?.toString() ?? '');
+        employeeId.value = parsed;
+        return parsed;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // ── Today's status ────────────────────────────────────────────────────────
+  // Primary source is POST /attendance/list (the exact call the web portal
+  // makes — the backend auto-scopes it to the JWT owner). If that comes back
+  // empty we fall back to GET /attendance/ledger, which returns the full day
+  // object under `day` when `recorded` is true.
+  Future<void> fetchTodayStatus() async {
+    isLoadingStatus.value = true;
+    final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+    Map<String, dynamic>? record;
+
+    try {
       final res = await _dio.post('/api/v1/attendance/list', data: {
         'page': 0,
         'size': 1,
@@ -57,52 +130,101 @@ class AttendanceController extends GetxController {
         'sortDir': 'DESC',
         'filters': {'dateFrom': today, 'dateTo': today},
       });
-      final record = (res.data?['data'] as List?)?.isNotEmpty == true
-          ? res.data['data'][0] as Map<String, dynamic>
-          : null;
-      if (record == null) return;
-
-      final punchIn = record['punchInTime'] ?? record['punchInTimeIST'];
-      final punchOut = record['punchOutTime'] ?? record['punchOutTimeIST'];
-      if (punchIn != null)
-        checkInTime.value = DateTime.tryParse(punchIn.toString());
-      if (punchOut != null)
-        checkOutTime.value = DateTime.tryParse(punchOut.toString());
-
-      if (checkInTime.value != null && checkOutTime.value == null) {
-        isCheckedIn.value = true;
-        elapsedSecs.value =
-            DateTime.now().difference(checkInTime.value!).inSeconds;
-        _elapsedTimer?.cancel();
-        _elapsedTimer = Timer.periodic(
-            const Duration(seconds: 1), (_) => elapsedSecs.value++);
-      } else if (checkOutTime.value != null) {
-        isCheckedIn.value = false;
-        elapsedSecs.value =
-            checkOutTime.value!.difference(checkInTime.value!).inSeconds;
+      final list = res.data?['data'] as List?;
+      if (list != null && list.isNotEmpty) {
+        record = Map<String, dynamic>.from(list.first as Map);
       }
     } catch (_) {}
+
+    if (record == null) {
+      final empId = await _resolveEmployeeId();
+      if (empId != null) {
+        try {
+          final res = await _dio.get('/api/v1/attendance/ledger',
+              queryParameters: {
+                'employeeId': empId,
+                'from': today,
+                'to': today
+              });
+          final list = res.data?['data'] as List?;
+          if (list != null && list.isNotEmpty) {
+            final entry = Map<String, dynamic>.from(list.first as Map);
+            if (entry['recorded'] == true && entry['day'] is Map) {
+              record = Map<String, dynamic>.from(entry['day'] as Map);
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    _applyRecord(record);
+    isLoadingStatus.value = false;
   }
+
+  /// Single place that derives UI state from an attendance record.
+  /// Passing null resets to NOT_CHECKED_IN (the old code returned early and
+  /// left stale state behind).
+  void _applyRecord(Map<String, dynamic>? record) {
+    _elapsedTimer?.cancel();
+
+    final inRaw = record?['punchInTime'] ?? record?['punchInTimeIST'];
+    final outRaw = record?['punchOutTime'] ?? record?['punchOutTimeIST'];
+
+    // toLocal() matters: the API returns UTC ("…T03:37:00.226Z"). Without it
+    // a 09:07 AM IST punch rendered as 03:37 AM.
+    final pin =
+        inRaw == null ? null : DateTime.tryParse(inRaw.toString())?.toLocal();
+    final pout =
+        outRaw == null ? null : DateTime.tryParse(outRaw.toString())?.toLocal();
+
+    checkInTime.value = pin;
+    checkOutTime.value = pout;
+
+    if (pin == null) {
+      attendanceStatus.value = statusNotIn;
+      isCheckedIn.value = false;
+      elapsedSecs.value = 0;
+    } else if (pout == null) {
+      attendanceStatus.value = statusIn;
+      isCheckedIn.value = true;
+      elapsedSecs.value =
+          DateTime.now().difference(pin).inSeconds.clamp(0, 86400).toInt();
+      _elapsedTimer = Timer.periodic(
+          const Duration(seconds: 1), (_) => elapsedSecs.value++);
+    } else {
+      attendanceStatus.value = statusOut;
+      isCheckedIn.value = false;
+      elapsedSecs.value =
+          pout.difference(pin).inSeconds.clamp(0, 86400).toInt();
+    }
+  }
+
+  Map<String, dynamic> _punchPayload(int? empId) => {
+        'employeeId': empId,
+        'punchTime': DateTime.now().toUtc().toIso8601String(),
+        'punchSource': _punchSource,
+        'latitude': null,
+        'longitude': null,
+      };
 
   Future<void> checkIn() async {
     if (isPunching.value) return;
     isPunching.value = true;
     try {
-      await _dio.post('/api/v1/attendance/punch-in', data: {});
-      checkInTime.value = DateTime.now();
-      checkOutTime.value = null;
-      isCheckedIn.value = true;
-      elapsedSecs.value = 0;
-      _elapsedTimer?.cancel();
-      _elapsedTimer = Timer.periodic(
-          const Duration(seconds: 1), (_) => elapsedSecs.value++);
-      Get.snackbar('Checked In', 'Attendance recorded.',
+      final empId = await _resolveEmployeeId();
+      // The old code posted an empty body — no employeeId, no punchTime — so
+      // the backend had nothing to record. This is the real fix.
+      await _dio.post('/api/v1/attendance/punch-in',
+          data: _punchPayload(empId));
+      // Re-read from the server so the displayed times are authoritative.
+      await fetchTodayStatus();
+      Get.snackbar('Checked In', 'Attendance recorded at $checkInDisplay.',
           backgroundColor: AppColors.success,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
           margin: const EdgeInsets.all(16));
     } on DioException catch (e) {
-      Get.snackbar('Failed', ApiFailure.fromDioException(e).message,
+      Get.snackbar('Check-in failed', ApiFailure.fromDioException(e).message,
           backgroundColor: AppColors.danger,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
@@ -116,17 +238,17 @@ class AttendanceController extends GetxController {
     if (isPunching.value) return;
     isPunching.value = true;
     try {
-      await _dio.post('/api/v1/attendance/punch-out', data: {});
-      checkOutTime.value = DateTime.now();
-      isCheckedIn.value = false;
-      _elapsedTimer?.cancel();
-      Get.snackbar('Checked Out', 'Attendance recorded.',
+      final empId = await _resolveEmployeeId();
+      await _dio.post('/api/v1/attendance/punch-out',
+          data: _punchPayload(empId));
+      await fetchTodayStatus();
+      Get.snackbar('Checked Out', 'Attendance recorded at $checkOutDisplay.',
           backgroundColor: AppColors.info,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
           margin: const EdgeInsets.all(16));
     } on DioException catch (e) {
-      Get.snackbar('Failed', ApiFailure.fromDioException(e).message,
+      Get.snackbar('Check-out failed', ApiFailure.fromDioException(e).message,
           backgroundColor: AppColors.danger,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
@@ -206,6 +328,7 @@ class _MainShellState extends State<MainShell> {
 
   @override
   Widget build(BuildContext context) {
+    // Read theme once — no Obx here; Scaffold bg is static per build
     final t = ThemeController.to;
     return Scaffold(
       backgroundColor: t.bg,
@@ -257,6 +380,7 @@ class _BottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Obx only here so border/bg update on theme toggle
     return Obx(() {
       final t = ThemeController.to;
       return Container(
@@ -322,7 +446,7 @@ class _BottomNav extends StatelessWidget {
                             horizontal: 12, vertical: 5),
                         decoration: BoxDecoration(
                             color: sel
-                                ? AppColors.accent.withOpacity(0.12)
+                                ? AppColors.accentLight
                                 : Colors.transparent,
                             borderRadius:
                                 BorderRadius.circular(AppRadius.full)),
@@ -350,7 +474,7 @@ class _BottomNav extends StatelessWidget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SIDEBAR
+// SIDEBAR — no Obx wrapper; reads t/auth directly in build()
 // ═══════════════════════════════════════════════════════════════════════════════
 class _Sidebar extends StatelessWidget {
   final VoidCallback onClose;
@@ -393,6 +517,7 @@ class _Sidebar extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // Header — dark gradient always
               Container(
                 padding: const EdgeInsets.fromLTRB(20, 20, 20, 20),
                 decoration: const BoxDecoration(
@@ -402,6 +527,7 @@ class _Sidebar extends StatelessWidget {
                       end: Alignment.bottomRight),
                 ),
                 child: Row(children: [
+                  // Avatar uses Obx for initials only
                   Obx(() => CircleAvatar(
                         radius: 24,
                         backgroundColor: Colors.white.withOpacity(0.2),
@@ -450,7 +576,7 @@ class _Sidebar extends StatelessWidget {
                       padding: const EdgeInsets.symmetric(
                           horizontal: 10, vertical: 5),
                       decoration: BoxDecoration(
-                          color: AppColors.accent.withOpacity(0.12),
+                          color: AppColors.accentLight,
                           borderRadius: BorderRadius.circular(AppRadius.full)),
                       child: Row(mainAxisSize: MainAxisSize.min, children: [
                         const Icon(Icons.business_rounded,
@@ -522,7 +648,7 @@ class _Sidebar extends StatelessWidget {
                   child: Container(
                     padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
-                      color: AppColors.danger.withOpacity(0.12),
+                      color: AppColors.dangerLight,
                       borderRadius: BorderRadius.circular(AppRadius.lg),
                       border:
                           Border.all(color: AppColors.danger.withOpacity(0.25)),
@@ -546,7 +672,7 @@ class _Sidebar extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(vertical: 12),
                 child: Center(
                   child: Text(
-                    'v 1.0',
+                    'v 1.1',
                     style: AppTextStyles.caption.copyWith(
                         color: t.textSec,
                         fontSize: 11,
@@ -614,7 +740,7 @@ class _SidebarTile extends StatelessWidget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// DASHBOARD PAGE
+// DASHBOARD PAGE — no outer Obx; sub-widgets handle their own reactivity
 // ═══════════════════════════════════════════════════════════════════════════════
 class DashboardPage extends StatelessWidget {
   const DashboardPage({super.key});
@@ -672,6 +798,40 @@ class DashboardPage extends StatelessWidget {
   }
 }
 
+// ── Dashboard loading skeleton — shimmer placeholders matching the stat grid ──
+class _DashboardSkeleton extends StatelessWidget {
+  const _DashboardSkeleton();
+
+  @override
+  Widget build(BuildContext context) {
+    final t = ThemeController.to;
+    Widget box(double h, {double? w, double r = AppRadius.lg}) => Container(
+        height: h,
+        width: w,
+        decoration: BoxDecoration(
+            color: t.surface, borderRadius: BorderRadius.circular(r)));
+    return Shimmer.fromColors(
+      baseColor: t.surface,
+      highlightColor: t.surfaceVar,
+      child: Column(children: [
+        Row(children: [
+          Expanded(child: box(96)),
+          const SizedBox(width: 10),
+          Expanded(child: box(96)),
+        ]),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(child: box(96)),
+          const SizedBox(width: 10),
+          Expanded(child: box(96)),
+        ]),
+        const SizedBox(height: 16),
+        box(64),
+      ]),
+    );
+  }
+}
+
 // ── Dashboard SliverAppBar ─────────────────────────────────────────────────────
 class _DashboardSliverAppBar extends StatelessWidget {
   void _showProfileSheet() {
@@ -694,7 +854,7 @@ class _DashboardSliverAppBar extends StatelessWidget {
             const SizedBox(height: 24),
             Obx(() => CircleAvatar(
                 radius: 36,
-                backgroundColor: AppColors.accent.withOpacity(0.12),
+                backgroundColor: AppColors.accentLight,
                 child: Text(auth.userInitials.value,
                     style: AppTextStyles.displayMedium
                         .copyWith(color: AppColors.accent, fontSize: 24)))),
@@ -747,6 +907,7 @@ class _DashboardSliverAppBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Obx here so app bar bg/text reacts to theme toggle
     return Obx(() {
       final t = ThemeController.to;
       final auth = Get.find<AuthController>();
@@ -795,7 +956,7 @@ class _DashboardSliverAppBar extends StatelessWidget {
               padding: const EdgeInsets.only(right: 14),
               child: CircleAvatar(
                   radius: 17,
-                  backgroundColor: AppColors.accent.withOpacity(0.12),
+                  backgroundColor: AppColors.accentLight,
                   child: Text(
                       auth.userInitials.value.isNotEmpty
                           ? auth.userInitials.value
@@ -815,6 +976,7 @@ class _DashboardSliverAppBar extends StatelessWidget {
 }
 
 // ── Employee Quick List ────────────────────────────────────────────────────────
+// FIX: removed `required this.t` constructor param; t is read locally in build()
 class _EmployeeQuickList extends StatelessWidget {
   const _EmployeeQuickList();
 
@@ -850,7 +1012,7 @@ class _EmployeeQuickList extends StatelessWidget {
                   padding:
                       const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                   decoration: BoxDecoration(
-                      color: AppColors.accent.withOpacity(0.12),
+                      color: AppColors.accentLight,
                       borderRadius: BorderRadius.circular(AppRadius.full)),
                   child: Text('View all',
                       style: AppTextStyles.caption.copyWith(
@@ -957,6 +1119,7 @@ class _QuickEmpRow extends StatelessWidget {
 // UNIFIED STAT CARD
 // Fixed height (110) ensures all cards in a row are identical in dimension
 // regardless of title length or subtitle presence.
+// FIX: added `borderColor` parameter (used by _WorkforceStatsGrid)
 // ═══════════════════════════════════════════════════════════════════════════════
 class _StatCard extends StatelessWidget {
   final String title;
@@ -964,6 +1127,7 @@ class _StatCard extends StatelessWidget {
   final String subtitle;
   final IconData icon;
   final Color color;
+  final Color borderColor;
   final ThemeController t;
 
   const _StatCard({
@@ -972,6 +1136,7 @@ class _StatCard extends StatelessWidget {
     required this.subtitle,
     required this.icon,
     required this.color,
+    required this.borderColor,
     required this.t,
   });
 
@@ -987,12 +1152,12 @@ class _StatCard extends StatelessWidget {
         boxShadow: t.cardShadow,
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        // Colour accent bar — identifies the metric category at a glance
+        // Colour accent bar — uses borderColor to identify metric category
         Container(
             height: 3,
             width: 40,
             decoration: BoxDecoration(
-                color: color,
+                color: borderColor,
                 borderRadius: BorderRadius.circular(AppRadius.full))),
         const SizedBox(height: 10),
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1040,8 +1205,6 @@ class _StatCard extends StatelessWidget {
 // ── Workforce Stats Grid ───────────────────────────────────────────────────────
 // 7 cards in a 2-column grid. The last card (Deactivated) gets a matching
 // spacer column so it aligns with cards above instead of stretching full-width.
-// crossAxisAlignment.stretch on every Row means both cards in a pair always
-// expand to match the taller sibling (enforced by the fixed height above).
 class _WorkforceStatsGrid extends StatelessWidget {
   final DashboardController ctrl;
   const _WorkforceStatsGrid({required this.ctrl});
@@ -1051,6 +1214,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
     final t = ThemeController.to;
     final w = ctrl.workforce.value!;
     return Column(children: [
+      // Row 1: Total, Deployed, Unassigned, Pending Onboarding
       Row(children: [
         Expanded(
             child: _StatCard(
@@ -1059,6 +1223,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: '${w.working} working',
                 icon: Icons.people_rounded,
                 color: AppColors.accent,
+                borderColor: AppColors.accent,
                 t: t)),
         const SizedBox(width: 10),
         Expanded(
@@ -1068,6 +1233,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: 'Billable',
                 icon: Icons.business_center_rounded,
                 color: AppColors.success,
+                borderColor: AppColors.success,
                 t: t)),
       ]),
       const SizedBox(height: 10),
@@ -1079,6 +1245,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: '${w.unassignedPct.toStringAsFixed(0)}% of working',
                 icon: Icons.warning_amber_rounded,
                 color: AppColors.warning,
+                borderColor: AppColors.warning,
                 t: t)),
         const SizedBox(width: 10),
         Expanded(
@@ -1088,9 +1255,11 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: 'Awaiting approval',
                 icon: Icons.schedule_rounded,
                 color: AppColors.info,
+                borderColor: AppColors.info,
                 t: t)),
       ]),
       const SizedBox(height: 10),
+      // Row 2: Pending Salary, Rejected, Deactivated
       Row(children: [
         Expanded(
             child: _StatCard(
@@ -1099,6 +1268,7 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: 'Awaiting compensation',
                 icon: Icons.attach_money_rounded,
                 color: const Color(0xFFD97706),
+                borderColor: const Color(0xFFD97706),
                 t: t)),
         const SizedBox(width: 10),
         Expanded(
@@ -1108,10 +1278,10 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: '',
                 icon: Icons.cancel_outlined,
                 color: AppColors.danger,
+                borderColor: AppColors.danger,
                 t: t)),
       ]),
       const SizedBox(height: 10),
-      // Deactivated — half-width to match the column rhythm above
       Row(children: [
         Expanded(
             child: _StatCard(
@@ -1120,9 +1290,9 @@ class _WorkforceStatsGrid extends StatelessWidget {
                 subtitle: '',
                 icon: Icons.person_off_rounded,
                 color: const Color(0xFF6B7280),
+                borderColor: const Color(0xFF6B7280),
                 t: t)),
-        const SizedBox(width: 10),
-        const Expanded(child: SizedBox()),
+        const Expanded(child: SizedBox()), // spacer
       ]),
     ]);
   }
@@ -1183,13 +1353,15 @@ class _SecondaryKpiRow extends StatelessWidget {
 }
 
 /// Compact variant of _StatCard for secondary KPI tiles.
-/// Fixed height (90) keeps all mini cards identical regardless of label length.
+/// Fixed height (90) and width (110) keeps all mini cards identical.
+// FIX: restored as a clean standalone class (was broken / merged with duplicate _StatCard)
 class _MiniStatCard extends StatelessWidget {
   final String value;
   final String label;
   final IconData icon;
   final Color color;
   final ThemeController t;
+
   const _MiniStatCard({
     required this.value,
     required this.label,
@@ -1245,9 +1417,6 @@ class _MiniStatCard extends StatelessWidget {
   }
 }
 
-// ── Hero Cards (Supervisor Pipeline + Managed Workforce) ──────────────────────
-// Pipeline mini-stats now use _PipelineStat tiles (card-shaped, consistent
-// with the rest of the dashboard) instead of bare text columns.
 class _HeroCards extends StatelessWidget {
   final DashboardController ctrl;
   const _HeroCards({required this.ctrl});
@@ -1257,7 +1426,6 @@ class _HeroCards extends StatelessWidget {
     final t = ThemeController.to;
     final me = ctrl.supervisorMetrics.value!;
     return Column(children: [
-      // ── Onboarding Pipeline ──
       Container(
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
@@ -1276,7 +1444,7 @@ class _HeroCards extends StatelessWidget {
             Container(
                 padding: const EdgeInsets.all(7),
                 decoration: BoxDecoration(
-                    color: AppColors.accent.withOpacity(0.12),
+                    color: AppColors.accentLight,
                     borderRadius: BorderRadius.circular(AppRadius.sm)),
                 child: const Icon(Icons.emoji_events_rounded,
                     color: AppColors.accent, size: 16)),
@@ -1289,38 +1457,15 @@ class _HeroCards extends StatelessWidget {
                   style: AppTextStyles.caption.copyWith(color: t.textTert)),
             ]),
           ]),
-          const SizedBox(height: 14),
-          // Pipeline stats — 2×2 grid of consistent tiles
+          const SizedBox(height: 16),
           Row(children: [
-            Expanded(
-                child: _PipelineStat(
-                    value: me.onboarded.toString(),
-                    label: 'Total Raised',
-                    color: t.textPrimary,
-                    t: t)),
-            const SizedBox(width: 8),
-            Expanded(
-                child: _PipelineStat(
-                    value: me.pending.toString(),
-                    label: 'Pending',
-                    color: AppColors.pipelinePending,
-                    t: t)),
-          ]),
-          const SizedBox(height: 8),
-          Row(children: [
-            Expanded(
-                child: _PipelineStat(
-                    value: me.approved.toString(),
-                    label: 'Approved',
-                    color: AppColors.pipelineApproved,
-                    t: t)),
-            const SizedBox(width: 8),
-            Expanded(
-                child: _PipelineStat(
-                    value: me.rejected.toString(),
-                    label: 'Rejected',
-                    color: AppColors.pipelineRejected,
-                    t: t)),
+            _mini(me.onboarded.toString(), 'Total Raised', t.textPrimary, t),
+            _mini(
+                me.pending.toString(), 'Pending', AppColors.pipelinePending, t),
+            _mini(me.approved.toString(), 'Approved',
+                AppColors.pipelineApproved, t),
+            _mini(me.rejected.toString(), 'Rejected',
+                AppColors.pipelineRejected, t),
           ]),
           const SizedBox(height: 12),
           PipelineStatusBar(
@@ -1356,7 +1501,6 @@ class _HeroCards extends StatelessWidget {
         ]),
       ),
       const SizedBox(height: 10),
-      // ── Managed Workforce ──
       Container(
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
@@ -1375,7 +1519,7 @@ class _HeroCards extends StatelessWidget {
             Container(
                 padding: const EdgeInsets.all(7),
                 decoration: BoxDecoration(
-                    color: AppColors.info.withOpacity(0.12),
+                    color: AppColors.infoLight,
                     borderRadius: BorderRadius.circular(AppRadius.sm)),
                 child: const Icon(Icons.shield_outlined,
                     color: AppColors.info, size: 16)),
@@ -1406,6 +1550,18 @@ class _HeroCards extends StatelessWidget {
     ]);
   }
 
+  Widget _mini(String v, String l, Color c, ThemeController t) => Expanded(
+          child: Column(children: [
+        Text(v,
+            style:
+                AppTextStyles.numericMedium.copyWith(color: c, fontSize: 20)),
+        const SizedBox(height: 2),
+        Text(l,
+            style:
+                AppTextStyles.caption.copyWith(color: t.textSec, fontSize: 10),
+            textAlign: TextAlign.center),
+      ]));
+
   Widget _dot(Color color, String label) =>
       Row(mainAxisSize: MainAxisSize.min, children: [
         Container(
@@ -1428,8 +1584,6 @@ class _HeroCards extends StatelessWidget {
 }
 
 /// Consistent stat tile inside the pipeline hero card.
-/// Uses a tinted background derived from the accent colour so each pipeline
-/// status is distinct but stays within the same card vocabulary.
 class _PipelineStat extends StatelessWidget {
   final String value;
   final String label;
@@ -1465,6 +1619,7 @@ class _PipelineStat extends StatelessWidget {
 }
 
 // ── Recent Onboarding Section ──────────────────────────────────────────────────
+// FIX: kept only this version (reads t locally). Removed old version that required this.t.
 class _RecentOnboardingSection extends StatelessWidget {
   final DashboardController ctrl;
   const _RecentOnboardingSection({required this.ctrl});
@@ -1521,85 +1676,364 @@ class _RecentOnboardingSection extends StatelessWidget {
 }
 
 // ── Pending Approvals Tile ─────────────────────────────────────────────────────
-// Consistent with the card system: surface background + coloured border accent
-// instead of a solid warning background. Tapping navigates to the Approvals tab.
 class _PendingTile extends StatelessWidget {
   final DashboardController ctrl;
   const _PendingTile({required this.ctrl});
 
   @override
   Widget build(BuildContext context) {
-    final t = ThemeController.to;
-    return GestureDetector(
-      onTap: () => TabSwitcher.switchTo(3),
-      child: Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-            color: t.surface,
-            borderRadius: BorderRadius.circular(AppRadius.lg),
-            border: Border.all(color: AppColors.warning.withOpacity(0.4)),
-            boxShadow: t.cardShadow),
-        child: Row(children: [
-          Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: AppColors.warning.withOpacity(0.12),
-              borderRadius: BorderRadius.circular(AppRadius.md),
-            ),
-            child: const Icon(Icons.hourglass_top_rounded,
-                color: AppColors.warning, size: 20),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-            Text('My Pending Approvals',
-                style: AppTextStyles.headingSmall.copyWith(color: t.textPrimary)),
-            Text(
-                '${ctrl.pendingApprovals.length} hire${ctrl.pendingApprovals.length == 1 ? '' : 's'} awaiting your action',
-                style: AppTextStyles.caption.copyWith(color: t.textSec)),
-          ])),
-          Text('Review',
-              style: AppTextStyles.buttonMedium.copyWith(color: AppColors.warning)),
-          const SizedBox(width: 4),
-          const Icon(Icons.arrow_forward_ios_rounded,
-              size: 12, color: AppColors.warning),
-        ]),
-      ),
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+          color: AppColors.warningLight,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: AppColors.warning.withOpacity(0.3))),
+      child: Row(children: [
+        const Icon(Icons.hourglass_top_rounded,
+            color: AppColors.warning, size: 22),
+        const SizedBox(width: 12),
+        Expanded(
+            child:
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('My Pending Approvals',
+              style: AppTextStyles.headingSmall
+                  .copyWith(color: AppColors.warning)),
+          Text(
+              '${ctrl.pendingApprovals.length} hire${ctrl.pendingApprovals.length == 1 ? '' : 's'} awaiting your action',
+              style: AppTextStyles.caption),
+        ])),
+        Text('Review',
+            style:
+                AppTextStyles.buttonMedium.copyWith(color: AppColors.warning)),
+        const SizedBox(width: 4),
+        const Icon(Icons.arrow_forward_ios_rounded,
+            size: 12, color: AppColors.warning),
+      ]),
     );
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ATTENDANCE PAGE
+// MY ATTENDANCE — month ledger + monthly summary
+// Mirrors the web portal's AttendanceCalendarPage: month nav (12 months of
+// history, no future months), a Sun–Sat grid coloured by status, and a
+// summary row driven by /monthly-summary.
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// One normalised calendar day from GET /attendance/ledger.
+class LedgerDay {
+  final DateTime date;
+  final bool recorded;
+
+  /// PRESENT | ABSENT | LATE | HALF_DAY | ON_LEAVE | HOLIDAY
+  /// | WEEK_OFF | FUTURE | NO_RECORD
+  final String status;
+
+  /// Raw attendance record — present only when [recorded] is true.
+  final Map<String, dynamic>? day;
+
+  const LedgerDay({
+    required this.date,
+    required this.recorded,
+    required this.status,
+    this.day,
+  });
+
+  factory LedgerDay.fromJson(Map<String, dynamic> j) {
+    final parsed = DateTime.tryParse((j['date'] ?? '').toString());
+    final rec = j['recorded'] == true;
+    final raw = j['day'];
+    final dayMap = raw is Map ? Map<String, dynamic>.from(raw) : null;
+    return LedgerDay(
+      date: parsed ?? DateTime.now(),
+      recorded: rec,
+      status: _derive(rec, dayMap, j['derivedStatus']),
+      day: dayMap,
+    );
+  }
+
+  // When a record exists the real status wins, but isHalfDay / isLate are
+  // surfaced as their own states (the backend keeps status = PRESENT and
+  // flags them separately, exactly like the web's summary counts them).
+  static String _derive(
+      bool recorded, Map<String, dynamic>? day, dynamic derived) {
+    if (recorded && day != null) {
+      if (day['isHalfDay'] == true) return 'HALF_DAY';
+      if (day['isLate'] == true) return 'LATE';
+      final s = (day['status'] ?? '').toString();
+      return s.isNotEmpty ? s : 'PRESENT';
+    }
+    final d = (derived ?? '').toString();
+    return d.isNotEmpty ? d : 'NO_RECORD';
+  }
+
+  // ── Derived display helpers ─────────────────────────────────────────────
+  String? get punchInIst =>
+      day?['punchInTimeIST']?.toString() ?? day?['punchInTime']?.toString();
+  String? get punchOutIst =>
+      day?['punchOutTimeIST']?.toString() ?? day?['punchOutTime']?.toString();
+  int get workingMinutes => (day?['workingMinutes'] as num?)?.toInt() ?? 0;
+  int get overtimeMinutes => (day?['overtimeMinutes'] as num?)?.toInt() ?? 0;
+}
+
+class MyAttendanceController extends GetxController {
+  final _api = EmployeeApi();
+
+  final loading = false.obs;
+  final summaryLoading = false.obs;
+  final error = ''.obs;
+  final ledger = <LedgerDay>[].obs;
+  final summary = Rxn<Map<String, dynamic>>();
+
+  /// First day of the month currently being viewed.
+  final activeMonth = DateTime(DateTime.now().year, DateTime.now().month).obs;
+
+  /// Matches the web's MAX_HISTORY_MONTHS.
+  static const int maxHistoryMonths = 12;
+
+  int get year => activeMonth.value.year;
+  int get month => activeMonth.value.month;
+
+  DateTime get _thisMonth =>
+      DateTime(DateTime.now().year, DateTime.now().month);
+
+  bool get canGoNext => activeMonth.value.isBefore(_thisMonth);
+  bool get canGoPrev {
+    final earliest =
+        DateTime(_thisMonth.year, _thisMonth.month - maxHistoryMonths);
+    final prev = DateTime(year, month - 1);
+    return !prev.isBefore(earliest);
+  }
+
+  @override
+  void onInit() {
+    super.onInit();
+    load();
+  }
+
+  void nextMonth() {
+    if (!canGoNext) return;
+    activeMonth.value = DateTime(year, month + 1);
+    load();
+  }
+
+  void prevMonth() {
+    if (!canGoPrev) return;
+    activeMonth.value = DateTime(year, month - 1);
+    load();
+  }
+
+  Future<void> load() async {
+    loading.value = true;
+    summaryLoading.value = true;
+    error.value = '';
+
+    // Reuse the punch controller's proven employee-id cascade
+    // (storage -> JWT claim -> first row of /employees/list).
+    int? empId;
+    if (Get.isRegistered<AttendanceController>()) {
+      empId = await Get.find<AttendanceController>().resolveEmployeeId();
+    }
+    if (empId == null) {
+      error.value = 'Could not identify the logged-in employee.';
+      ledger.clear();
+      summary.value = null;
+      loading.value = false;
+      summaryLoading.value = false;
+      return;
+    }
+
+    final first = DateTime(year, month, 1);
+    final last = DateTime(year, month + 1, 0); // day 0 of next month
+    final from = DateFormat('yyyy-MM-dd').format(first);
+    final to = DateFormat('yyyy-MM-dd').format(last);
+
+    try {
+      final rows =
+          await _api.getAttendanceLedger(employeeId: empId, from: from, to: to);
+      ledger.assignAll(rows
+          .whereType<Map>()
+          .map((e) => LedgerDay.fromJson(Map<String, dynamic>.from(e)))
+          .toList());
+    } on DioException catch (e) {
+      error.value = ApiFailure.fromDioException(e).message;
+      ledger.clear();
+    } catch (e) {
+      error.value = 'Failed to load attendance: $e';
+      ledger.clear();
+    } finally {
+      loading.value = false;
+    }
+
+    // Summary is best-effort — the grid stays usable if it fails.
+    try {
+      summary.value = await _api.getMonthlySummary(empId, month, year);
+    } catch (_) {
+      summary.value = null;
+    } finally {
+      summaryLoading.value = false;
+    }
+  }
+
+  /// Counts for the summary row. Prefers /monthly-summary (what the web
+  /// shows) and falls back to counting the ledger when it isn't available.
+  Map<String, int> get counts {
+    final s = summary.value;
+    if (s != null) {
+      int n(String k) => (s[k] as num?)?.toInt() ?? 0;
+      return {
+        'present': n('presentDays'),
+        'absent': n('absentDays'),
+        'late': n('lateDays'),
+        'leave': n('leavesTaken'),
+        'halfDay': n('halfDays'),
+      };
+    }
+    final c = {'present': 0, 'absent': 0, 'late': 0, 'leave': 0, 'halfDay': 0};
+    for (final d in ledger) {
+      switch (d.status) {
+        case 'PRESENT':
+          c['present'] = c['present']! + 1;
+          break;
+        case 'ABSENT':
+          c['absent'] = c['absent']! + 1;
+          break;
+        case 'LATE':
+          c['late'] = c['late']! + 1;
+          break;
+        case 'ON_LEAVE':
+        case 'LEAVE':
+          c['leave'] = c['leave']! + 1;
+          break;
+        case 'HALF_DAY':
+          c['halfDay'] = c['halfDay']! + 1;
+          break;
+      }
+    }
+    return c;
+  }
+
+  String summaryText(String key) {
+    final v = summary.value?[key];
+    if (v == null) return '—';
+    return v.toString();
+  }
+}
+
+// ── Status -> colour / label, shared by the grid, legend and detail sheet ──
+class AttendanceStatusStyle {
+  final Color color;
+  final String label;
+  const AttendanceStatusStyle(this.color, this.label);
+
+  static AttendanceStatusStyle of(String status) {
+    switch (status) {
+      case 'PRESENT':
+        return const AttendanceStatusStyle(AppColors.success, 'Present');
+      case 'ABSENT':
+        return const AttendanceStatusStyle(AppColors.danger, 'Absent');
+      case 'LATE':
+        return const AttendanceStatusStyle(AppColors.warning, 'Late');
+      case 'HALF_DAY':
+        return const AttendanceStatusStyle(AppColors.info, 'Half Day');
+      case 'ON_LEAVE':
+      case 'LEAVE':
+        return const AttendanceStatusStyle(AppColors.accent, 'On Leave');
+      case 'HOLIDAY':
+        return const AttendanceStatusStyle(Color(0xFF7C3AED), 'Holiday');
+      case 'WEEK_OFF':
+      case 'WEEKEND':
+        return const AttendanceStatusStyle(AppColors.textTertiary, 'Week Off');
+      case 'FUTURE':
+        return const AttendanceStatusStyle(AppColors.textTertiary, '—');
+      default: // NO_RECORD
+        return const AttendanceStatusStyle(AppColors.textTertiary, 'No Record');
+    }
+  }
+}
+
 class AttendancePage extends StatelessWidget {
   const AttendancePage({super.key});
 
   static const _days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   static const _months = [
-    'January', 'February', 'March', 'April', 'May', 'June',
-    'July', 'August', 'September', 'October', 'November', 'December'
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December'
   ];
 
   @override
   Widget build(BuildContext context) {
     final ctrl = Get.find<AttendanceController>();
-    return Obx(() {
-      final t = ThemeController.to;
-      return Scaffold(
+    final t = ThemeController.to;
+    // Two sections, as separate tabs: My Attendance (month ledger) and
+    // Check In / Out (the existing punch flow, unchanged).
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
         backgroundColor: t.bg,
         appBar: SharedAppBar(
           title: 'Attendance',
           subtitle: _buildSubtitle(ctrl),
+          bottom: TabBar(
+            labelColor: AppColors.accent,
+            unselectedLabelColor: t.textSec,
+            indicatorColor: AppColors.accent,
+            indicatorWeight: 2.5,
+            labelStyle: AppTextStyles.buttonMedium,
+            unselectedLabelStyle: AppTextStyles.buttonMedium,
+            tabs: const [
+              Tab(text: 'My Attendance'),
+              Tab(text: 'Check In / Out'),
+            ],
+          ),
         ),
-        body: SingleChildScrollView(
-          padding: const EdgeInsets.all(16),
-          child: Column(children: [
-            _ClockCard(ctrl: ctrl, days: _days, months: _months),
-            const SizedBox(height: 16),
-            Obx(() => Row(children: [
+        body: TabBarView(children: [
+          const _MyAttendanceTab(),
+          _CheckInOutTab(ctrl: ctrl, days: _days, months: _months),
+        ]),
+      ),
+    );
+  }
+
+  String _buildSubtitle(AttendanceController ctrl) {
+    final now = ctrl.currentTime.value;
+    return '${_days[now.weekday - 1]}, ${now.day} ${_months[now.month - 1]} ${now.year}';
+  }
+}
+
+// ── Check In / Out tab — the existing punch flow, moved verbatim ─────────────
+class _CheckInOutTab extends StatelessWidget {
+  final AttendanceController ctrl;
+  final List<String> days;
+  final List<String> months;
+  const _CheckInOutTab(
+      {required this.ctrl, required this.days, required this.months});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = ThemeController.to;
+    // Pull-to-refresh re-reads today's punch state from the server.
+    return RefreshIndicator(
+      onRefresh: ctrl.fetchTodayStatus,
+      color: AppColors.accent,
+      child: SingleChildScrollView(
+        physics: const AlwaysScrollableScrollPhysics(
+            parent: BouncingScrollPhysics()),
+        padding: const EdgeInsets.all(16),
+        child: Column(children: [
+          _ClockCard(ctrl: ctrl, days: days, months: months),
+          const SizedBox(height: 16),
+          Obx(() => Row(children: [
                 Expanded(
                     child: _TimeTile(
                         label: 'Check In',
@@ -1726,12 +2160,6 @@ class AttendancePage extends StatelessWidget {
         ]),
       ),
     );
-    });
-  }
-
-  String _buildSubtitle(AttendanceController ctrl) {
-    final now = ctrl.currentTime.value;
-    return '${_days[now.weekday - 1]}, ${now.day} ${_months[now.month - 1]} ${now.year}';
   }
 
   Widget _legend(ThemeController t, Color color, String label) =>
@@ -1762,6 +2190,7 @@ class _ClockCard extends StatelessWidget {
       final sec = now.second.toString().padLeft(2, '0');
       final ampm = now.hour >= 12 ? 'PM' : 'AM';
       final chk = ctrl.isCheckedIn.value;
+      final done = ctrl.hasCheckedOut;
       return Container(
         width: double.infinity,
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 28),
@@ -1771,10 +2200,15 @@ class _ClockCard extends StatelessWidget {
                   colors: [Color(0xFF065F46), Color(0xFF059669)],
                   begin: Alignment.topLeft,
                   end: Alignment.bottomRight)
-              : const LinearGradient(
-                  colors: [Color(0xFF1E293B), Color(0xFF312E81)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight),
+              : done
+                  ? const LinearGradient(
+                      colors: [Color(0xFF1E3A5F), Color(0xFF0E7490)],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight)
+                  : const LinearGradient(
+                      colors: [Color(0xFF1E293B), Color(0xFF312E81)],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight),
           borderRadius: BorderRadius.circular(24),
           boxShadow: [
             BoxShadow(
@@ -1797,10 +2231,17 @@ class _ClockCard extends StatelessWidget {
                   decoration: BoxDecoration(
                       color: chk
                           ? const Color(0xFF6EE7B7)
-                          : const Color(0xFF94A3B8),
+                          : done
+                              ? const Color(0xFF67E8F9)
+                              : const Color(0xFF94A3B8),
                       shape: BoxShape.circle)),
               const SizedBox(width: 6),
-              Text(chk ? 'Checked In' : 'Not Checked In',
+              Text(
+                  chk
+                      ? 'Checked In'
+                      : done
+                          ? 'Checked Out'
+                          : 'Not Checked In',
                   style: const TextStyle(
                       color: Colors.white,
                       fontSize: 12,
@@ -1872,24 +2313,49 @@ class _CheckButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return Obx(() {
       final chk = ctrl.isCheckedIn.value;
+      final done = ctrl.hasCheckedOut;
       final punching = ctrl.isPunching.value;
+
+      // Once the day is closed the button is disabled — previously it flipped
+      // back to "Check In", which let the user punch in twice in one day.
+      final VoidCallback? action =
+          (punching || done) ? null : (chk ? ctrl.checkOut : ctrl.checkIn);
+
+      final LinearGradient gradient = done
+          ? const LinearGradient(colors: [Color(0xFF94A3B8), Color(0xFF64748B)])
+          : chk
+              ? const LinearGradient(
+                  colors: [Color(0xFFDC2626), Color(0xFFB91C1C)])
+              : const LinearGradient(
+                  colors: [Color(0xFF059669), Color(0xFF047857)]);
+
+      final Color glow = done
+          ? AppColors.textTertiary
+          : chk
+              ? AppColors.danger
+              : AppColors.success;
+
+      final IconData icon = done
+          ? Icons.check_circle_rounded
+          : chk
+              ? Icons.logout_rounded
+              : Icons.login_rounded;
+
+      final String label =
+          done ? 'Checked Out' : (chk ? 'Check Out' : 'Check In');
+
       return GestureDetector(
-        onTap: punching ? null : (chk ? ctrl.checkOut : ctrl.checkIn),
+        onTap: action,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 250),
           width: double.infinity,
           height: 58,
           decoration: BoxDecoration(
-            gradient: chk
-                ? const LinearGradient(
-                    colors: [Color(0xFFDC2626), Color(0xFFB91C1C)])
-                : const LinearGradient(
-                    colors: [Color(0xFF059669), Color(0xFF047857)]),
+            gradient: gradient,
             borderRadius: BorderRadius.circular(16),
             boxShadow: [
               BoxShadow(
-                  color: (chk ? AppColors.danger : AppColors.success)
-                      .withOpacity(0.35),
+                  color: glow.withOpacity(done ? 0.18 : 0.35),
                   blurRadius: 16,
                   offset: const Offset(0, 6))
             ],
@@ -1903,10 +2369,9 @@ class _CheckButton extends StatelessWidget {
                           strokeWidth: 2.5,
                           valueColor: AlwaysStoppedAnimation(Colors.white))))
               : Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                  Icon(chk ? Icons.logout_rounded : Icons.login_rounded,
-                      color: Colors.white, size: 22),
+                  Icon(icon, color: Colors.white, size: 22),
                   const SizedBox(width: 10),
-                  Text(chk ? 'Check Out' : 'Check In',
+                  Text(label,
                       style: const TextStyle(
                           color: Colors.white,
                           fontSize: 17,
@@ -1994,15 +2459,15 @@ class _WeekDay extends StatelessWidget {
     Color bg, fg;
     switch (status) {
       case 'present':
-        bg = AppColors.success.withOpacity(0.12);
+        bg = AppColors.successLight;
         fg = AppColors.success;
         break;
       case 'today':
-        bg = AppColors.accent.withOpacity(0.12);
+        bg = AppColors.accentLight;
         fg = AppColors.accent;
         break;
       case 'absent':
-        bg = AppColors.danger.withOpacity(0.12);
+        bg = AppColors.dangerLight;
         fg = AppColors.danger;
         break;
       default:
@@ -2032,40 +2497,454 @@ class _WeekDay extends StatelessWidget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MY REQUESTS PLACEHOLDER
+// MY ATTENDANCE TAB — month nav + calendar grid + legend + monthly summary
+// FIX: replaced placeholder body ("My Submissions") with real calendar/attendance UI.
+//      Also removed the floating code that was outside the class body.
 // ═══════════════════════════════════════════════════════════════════════════════
-class _SubmissionsPage extends StatelessWidget {
-  const _SubmissionsPage();
+class _MyAttendanceTab extends StatelessWidget {
+  const _MyAttendanceTab();
+
+  static const _monthNames = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December'
+  ];
 
   @override
   Widget build(BuildContext context) {
-    return Obx(() {
-      final t = ThemeController.to;
-      return Scaffold(
-        backgroundColor: t.bg,
-        appBar: SharedAppBar(title: 'My Requests'),
-        body: Center(
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Container(
-              width: 72,
-              height: 72,
+    // isRegistered guard: TabBarView rebuilds this widget, and a bare
+    // Get.put would replace the controller and re-run onInit (refetching)
+    // every time the tab is rebuilt.
+    final ctrl = Get.isRegistered<MyAttendanceController>()
+        ? Get.find<MyAttendanceController>()
+        : Get.put(MyAttendanceController());
+    final t = ThemeController.to;
+
+    return RefreshIndicator(
+      onRefresh: ctrl.load,
+      color: AppColors.accent,
+      child: SingleChildScrollView(
+        physics: const AlwaysScrollableScrollPhysics(
+            parent: BouncingScrollPhysics()),
+        padding: const EdgeInsets.all(16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // ── Month navigation ──────────────────────────────────────────
+          Obx(() => Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                decoration: BoxDecoration(
+                    color: t.surface,
+                    borderRadius: BorderRadius.circular(AppRadius.lg),
+                    border: Border.all(color: t.border),
+                    boxShadow: t.cardShadow),
+                child: Row(children: [
+                  _navBtn(
+                      icon: Icons.chevron_left_rounded,
+                      enabled: ctrl.canGoPrev,
+                      onTap: ctrl.prevMonth,
+                      t: t),
+                  Expanded(
+                    child: Text(
+                      '${_monthNames[ctrl.month - 1]} ${ctrl.year}',
+                      textAlign: TextAlign.center,
+                      style: AppTextStyles.headingSmall
+                          .copyWith(color: t.textPrimary),
+                    ),
+                  ),
+                  _navBtn(
+                      icon: Icons.chevron_right_rounded,
+                      enabled: ctrl.canGoNext,
+                      onTap: ctrl.nextMonth,
+                      t: t),
+                ]),
+              )),
+          const SizedBox(height: 14),
+
+          // ── Calendar grid ─────────────────────────────────────────────
+          Obx(() {
+            if (ctrl.loading.value) {
+              return _calendarSkeleton(t);
+            }
+            if (ctrl.error.value.isNotEmpty && ctrl.ledger.isEmpty) {
+              return Container(
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                    color: t.surface,
+                    borderRadius: BorderRadius.circular(AppRadius.lg),
+                    border: Border.all(color: t.border)),
+                child: Column(children: [
+                  const Icon(Icons.error_outline_rounded,
+                      color: AppColors.danger, size: 40),
+                  const SizedBox(height: 10),
+                  Text(ctrl.error.value,
+                      textAlign: TextAlign.center,
+                      style:
+                          AppTextStyles.bodySmall.copyWith(color: t.textSec)),
+                  const SizedBox(height: 12),
+                  ElevatedButton(
+                      onPressed: ctrl.load, child: const Text('Retry')),
+                ]),
+              );
+            }
+            return _AttendanceCalendarGrid(
+                ctrl: ctrl, year: ctrl.year, month: ctrl.month, t: t);
+          }),
+          const SizedBox(height: 14),
+
+          // ── Legend ────────────────────────────────────────────────────
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+                color: t.surface,
+                borderRadius: BorderRadius.circular(AppRadius.lg),
+                border: Border.all(color: t.border)),
+            child: Wrap(spacing: 14, runSpacing: 8, children: const [
+              _LegendDot(status: 'PRESENT'),
+              _LegendDot(status: 'ABSENT'),
+              _LegendDot(status: 'LATE'),
+              _LegendDot(status: 'HALF_DAY'),
+              _LegendDot(status: 'ON_LEAVE'),
+              _LegendDot(status: 'HOLIDAY'),
+              _LegendDot(status: 'WEEK_OFF'),
+            ]),
+          ),
+          const SizedBox(height: 16),
+
+          // ── Monthly summary ───────────────────────────────────────────
+          Obx(() {
+            final c = ctrl.counts;
+            final busy = ctrl.summaryLoading.value;
+            return Container(
+              padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                  color: AppColors.accent.withOpacity(0.12),
-                  borderRadius: BorderRadius.circular(AppRadius.xl)),
-              child: const Icon(Icons.assignment_outlined,
-                  color: AppColors.accent, size: 32),
-            ),
-            const SizedBox(height: 16),
-            Text('My Submissions',
-                style:
-                    AppTextStyles.headingMedium.copyWith(color: t.textPrimary)),
-            const SizedBox(height: 8),
-            Text('Hires you raised and their approval status.',
-                style: AppTextStyles.bodySmall.copyWith(color: t.textSec),
-                textAlign: TextAlign.center),
-          ]),
+                  color: t.surface,
+                  borderRadius: BorderRadius.circular(AppRadius.lg),
+                  border: Border.all(color: t.border),
+                  boxShadow: t.cardShadow),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Monthly Summary',
+                        style: AppTextStyles.headingSmall
+                            .copyWith(color: t.textPrimary)),
+                    const SizedBox(height: 12),
+                    Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        children: [
+                          _SummaryStat(
+                              label: 'Present',
+                              value: busy ? '—' : '${c['present']}',
+                              color: AppColors.success,
+                              t: t),
+                          _SummaryStat(
+                              label: 'Absent',
+                              value: busy ? '—' : '${c['absent']}',
+                              color: AppColors.danger,
+                              t: t),
+                          _SummaryStat(
+                              label: 'Late',
+                              value: busy ? '—' : '${c['late']}',
+                              color: AppColors.warning,
+                              t: t),
+                          _SummaryStat(
+                              label: 'Leave',
+                              value: busy ? '—' : '${c['leave']}',
+                              color: AppColors.accent,
+                              t: t),
+                          _SummaryStat(
+                              label: 'Half Day',
+                              value: busy ? '—' : '${c['halfDay']}',
+                              color: AppColors.info,
+                              t: t),
+                        ]),
+                    const SizedBox(height: 12),
+                    Divider(color: t.border),
+                    const SizedBox(height: 12),
+                    Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        children: [
+                          _SummaryStat(
+                              label: 'Working Hrs',
+                              value: busy ? '—' : ctrl.summaryText('workingHours'),
+                              color: t.textPrimary,
+                              t: t),
+                          _SummaryStat(
+                              label: 'OT Hours',
+                              value: busy ? '—' : ctrl.summaryText('overtimeHours'),
+                              color: t.textPrimary,
+                              t: t),
+                          _SummaryStat(
+                              label: 'LOP',
+                              value: busy ? '—' : ctrl.summaryText('lopDays'),
+                              color: t.textPrimary,
+                              t: t),
+                        ]),
+                  ]),
+            );
+          }),
+          const SizedBox(height: 24),
+        ]),
+      ),
+    );
+  }
+
+  Widget _navBtn(
+      {required IconData icon,
+      required bool enabled,
+      required VoidCallback onTap,
+      required ThemeController t}) {
+    return IconButton(
+      onPressed: enabled ? onTap : null,
+      icon: Icon(icon,
+          size: 26,
+          color: enabled ? t.textPrimary : t.textTert.withOpacity(0.4)),
+      splashRadius: 22,
+    );
+  }
+
+  Widget _calendarSkeleton(ThemeController t) => Shimmer.fromColors(
+        baseColor: t.surface,
+        highlightColor: t.surfaceVar,
+        child: Container(
+          height: 320,
+          decoration: BoxDecoration(
+              color: t.surface,
+              borderRadius: BorderRadius.circular(AppRadius.lg)),
         ),
       );
-    });
+}
+
+// ── Legend chip ──────────────────────────────────────────────────────────────
+class _LegendDot extends StatelessWidget {
+  final String status;
+  const _LegendDot({required this.status});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = ThemeController.to;
+    final s = AttendanceStatusStyle.of(status);
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+              color: s.color, borderRadius: BorderRadius.circular(3))),
+      const SizedBox(width: 5),
+      Text(s.label,
+          style:
+              AppTextStyles.caption.copyWith(color: t.textSec, fontSize: 11)),
+    ]);
+  }
+}
+
+// ── Calendar grid (Sun–Sat, leading empties) ─────────────────────────────────
+class _AttendanceCalendarGrid extends StatelessWidget {
+  final MyAttendanceController ctrl;
+  final int year, month;
+  final ThemeController t;
+  const _AttendanceCalendarGrid(
+      {required this.ctrl,
+      required this.year,
+      required this.month,
+      required this.t});
+
+  static const _headers = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  @override
+  Widget build(BuildContext context) {
+    // O(1) lookup by day-of-month, same approach as the web grid.
+    final byDay = <int, LedgerDay>{};
+    for (final d in ctrl.ledger) {
+      byDay[d.date.day] = d;
+    }
+
+    final daysInMonth = DateTime(year, month + 1, 0).day;
+    // weekday: Mon=1..Sun=7 -> Sun=0..Sat=6 for a Sunday-first grid.
+    final leading = DateTime(year, month, 1).weekday % 7;
+
+    final now = DateTime.now();
+    final cells = <Widget>[];
+    for (var i = 0; i < leading; i++) {
+      cells.add(const SizedBox.shrink());
+    }
+    for (var d = 1; d <= daysInMonth; d++) {
+      final isToday = now.year == year && now.month == month && now.day == d;
+      cells.add(
+          _AttendanceDayCell(day: d, entry: byDay[d], isToday: isToday, t: t));
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+          color: t.surface,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: t.border),
+          boxShadow: t.cardShadow),
+      child: Column(children: [
+        Row(
+            children: _headers
+                .map((h) => Expanded(
+                      child: Center(
+                        child: Text(h,
+                            style: AppTextStyles.caption.copyWith(
+                                color: t.textTert,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600)),
+                      ),
+                    ))
+                .toList()),
+        const SizedBox(height: 8),
+        GridView.count(
+          crossAxisCount: 7,
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          mainAxisSpacing: 6,
+          crossAxisSpacing: 6,
+          children: cells,
+        ),
+      ]),
+    );
+  }
+}
+
+// ── One day square ───────────────────────────────────────────────────────────
+class _AttendanceDayCell extends StatelessWidget {
+  final int day;
+  final LedgerDay? entry;
+  final bool isToday;
+  final ThemeController t;
+  const _AttendanceDayCell(
+      {required this.day,
+      required this.entry,
+      required this.isToday,
+      required this.t});
+
+  @override
+  Widget build(BuildContext context) {
+    final status = entry?.status ?? 'NO_RECORD';
+    final isFuture = status == 'FUTURE';
+    final isBlank = status == 'NO_RECORD' || isFuture;
+    final s = AttendanceStatusStyle.of(status);
+
+    // Blank days (no record / future) get no fill — only recorded or
+    // explicitly-derived states are coloured, matching the web grid.
+    final bg = isBlank ? t.surfaceVar : s.color.withOpacity(0.14);
+    final fg = isFuture
+        ? t.textTert.withOpacity(0.5)
+        : isBlank
+            ? t.textSec
+            : s.color;
+
+    return GestureDetector(
+      onTap:
+          entry?.recorded == true ? () => _showDetail(context, entry!) : null,
+      child: Container(
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: isToday ? AppColors.accent : Colors.transparent,
+            width: isToday ? 2 : 0,
+          ),
+        ),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Text('$day',
+              style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: isToday ? FontWeight.w800 : FontWeight.w600,
+                  color: fg)),
+          if (!isBlank) ...[
+            const SizedBox(height: 2),
+            Container(
+                width: 14,
+                height: 3,
+                decoration: BoxDecoration(
+                    color: s.color, borderRadius: BorderRadius.circular(2))),
+          ],
+        ]),
+      ),
+    );
+  }
+
+  void _showDetail(BuildContext context, LedgerDay e) {
+    final t = ThemeController.to;
+    final s = AttendanceStatusStyle.of(e.status);
+    String fmt(String? iso) {
+      if (iso == null) return '--:--';
+      final d = DateTime.tryParse(iso)?.toLocal();
+      if (d == null) return '--:--';
+      final h12 =
+          (d.hour % 12 == 0 ? 12 : d.hour % 12).toString().padLeft(2, '0');
+      return '$h12:${d.minute.toString().padLeft(2, '0')} '
+          '${d.hour >= 12 ? 'PM' : 'AM'}';
+    }
+
+    Widget row(String label, String value) => Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: Row(children: [
+            SizedBox(
+                width: 120,
+                child: Text(label,
+                    style: AppTextStyles.caption.copyWith(color: t.textTert))),
+            Expanded(
+                child: Text(value,
+                    style: AppTextStyles.bodySmall.copyWith(
+                        color: t.textPrimary, fontWeight: FontWeight.w500))),
+          ]),
+        );
+
+    Get.bottomSheet(
+      Container(
+        padding: EdgeInsets.fromLTRB(
+            20, 14, 20, 20 + MediaQuery.of(context).viewPadding.bottom),
+        decoration: BoxDecoration(
+            color: t.surface,
+            borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(24), topRight: Radius.circular(24))),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                  color: t.border, borderRadius: BorderRadius.circular(100))),
+          const SizedBox(height: 18),
+          Row(children: [
+            Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                    color: s.color.withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(AppRadius.full)),
+                child: Text(s.label,
+                    style: AppTextStyles.caption.copyWith(
+                        color: s.color, fontWeight: FontWeight.w700))),
+            const Spacer(),
+            Text(DateFormat('EEE, d MMM yyyy').format(e.date),
+                style: AppTextStyles.caption.copyWith(color: t.textSec)),
+          ]),
+          const SizedBox(height: 18),
+          row('Check In', fmt(e.punchInIst)),
+          row('Check Out', fmt(e.punchOutIst)),
+          row('Working Hours',
+              '${(e.workingMinutes ~/ 60)}h ${(e.workingMinutes % 60)}m'),
+          if (e.overtimeMinutes > 0)
+            row('Overtime',
+                '${(e.overtimeMinutes ~/ 60)}h ${(e.overtimeMinutes % 60)}m'),
+          if ((e.day?['punchInSource'] ?? '').toString().isNotEmpty)
+            row('Source', e.day!['punchInSource'].toString()),
+          if ((e.day?['remarks'] ?? '').toString().isNotEmpty)
+            row('Remarks', e.day!['remarks'].toString()),
+          const SizedBox(height: 4),
+        ]),
+      ),
+    );
   }
 }

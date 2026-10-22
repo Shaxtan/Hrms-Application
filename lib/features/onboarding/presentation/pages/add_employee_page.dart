@@ -14,6 +14,44 @@ import '../../data/employee_api.dart';
 import '../../domain/employee_models.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// DATE HELPERS — display is DD-MM-YYYY; API payload is YYYY-MM-DD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert display text (DD-MM-YYYY) → API value (YYYY-MM-DD).
+/// Returns the original string unchanged if it doesn't match the pattern.
+String _toApi(String display) {
+  if (display.length != 10) return display;
+  final parts = display.split('-');
+  if (parts.length != 3) return display;
+  // DD-MM-YYYY  → parts[0]=DD, parts[1]=MM, parts[2]=YYYY
+  if (parts[2].length == 4) {
+    return '${parts[2]}-${parts[1]}-${parts[0]}';
+  }
+  return display;
+}
+
+/// A TextInputFormatter that keeps the cursor at the end and auto-inserts
+/// dashes so the user can type DD-MM-YYYY without pressing '-' themselves.
+class _DateFormatter extends TextInputFormatter {
+  @override
+  TextEditingValue formatEditUpdate(
+      TextEditingValue oldValue, TextEditingValue newValue) {
+    // Strip everything that is not a digit
+    final digits = newValue.text.replaceAll(RegExp(r'[^0-9]'), '');
+    final buf = StringBuffer();
+    for (int i = 0; i < digits.length && i < 8; i++) {
+      if (i == 2 || i == 4) buf.write('-');
+      buf.write(digits[i]);
+    }
+    final result = buf.toString();
+    return TextEditingValue(
+      text: result,
+      selection: TextSelection.collapsed(offset: result.length),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CONTROLLER — real API: multi-step create + side-steps
 // ═══════════════════════════════════════════════════════════════════════════════
 class AddEmployeeController extends GetxController {
@@ -34,6 +72,9 @@ class AddEmployeeController extends GetxController {
   final submitting = false.obs;
   final missingFields = <String>[].obs;
   final missingDocs = <String>[].obs;
+
+  // "Current address same as permanent" toggle
+  final sameAsPermAddress = false.obs;
 
   // Family members (staged locally until submit)
   final familyMembers = <Map<String, dynamic>>[].obs;
@@ -82,11 +123,13 @@ class AddEmployeeController extends GetxController {
   final emailController = TextEditingController();
   final phoneController = TextEditingController();
   final secondaryPhoneController = TextEditingController();
+  // NOTE: dobController stores DD-MM-YYYY for display; _toApi() converts before sending.
   final dobController = TextEditingController();
   final bloodGroupController = TextEditingController();
   final casteController = TextEditingController();
   final permanentAddressController = TextEditingController();
   final currentAddressController = TextEditingController();
+  // NOTE: joiningDateController and confirmationDateController store DD-MM-YYYY.
   final joiningDateController = TextEditingController();
   final confirmationDateController = TextEditingController();
   final clientController = TextEditingController();
@@ -100,7 +143,6 @@ class AddEmployeeController extends GetxController {
   final pfController = TextEditingController();
   final esicController = TextEditingController();
 
-  bool _currentAddressTouched = false;
   bool _confirmationTouched = false;
 
   @override
@@ -140,20 +182,61 @@ class AddEmployeeController extends GetxController {
       recomputeMissing();
     });
 
+    // ── Uppercase + length rules, enforced on the controllers themselves ──
+    // These work regardless of whether AppTextField forwards inputFormatters.
+    _forceUpper(fullNameController);
+    _forceUpper(fatherHusbandNameController);
+    _forceUpper(motherNameController);
+    _forceUpper(bloodGroupController);
+    _forceUpper(casteController);
+    _forceUpper(permanentAddressController);
+    _forceUpper(currentAddressController);
+    _forceUpper(pfController);
+    _forceUpper(ifscController, maxLength: 11, alphaNumOnly: true);
+    _forceUpper(panController, maxLength: 10, alphaNumOnly: true);
+
+    // ── DD-MM-YYYY mask on every date field (typed input) ──────────────
+    _dateMask(dobController);
+    _dateMask(joiningDateController);
+    _dateMask(confirmationDateController);
+
+    // Permanent address → copy into current ONLY while the
+    // "same as permanent" checkbox is ticked. Unticked = fully independent.
     permanentAddressController.addListener(() {
-      if (!_currentAddressTouched) {
+      if (sameAsPermAddress.value &&
+          currentAddressController.text != permanentAddressController.text) {
         currentAddressController.text = permanentAddressController.text;
       }
     });
 
+    // While ticked, current address is locked to permanent address.
+    currentAddressController.addListener(() {
+      if (sameAsPermAddress.value &&
+          currentAddressController.text != permanentAddressController.text) {
+        currentAddressController.text = permanentAddressController.text;
+      }
+    });
+
+    // Checkbox ticked → copy permanent into current.
+    // Checkbox unticked → clear current so a different address can be typed.
+    ever(sameAsPermAddress, (bool same) {
+      currentAddressController.text =
+          same ? permanentAddressController.text : '';
+      recomputeMissing();
+    });
+
+    // Joining date → auto-set confirmation date (+6 months).
+    // The controllers now store DD-MM-YYYY, so parse accordingly.
     joiningDateController.addListener(() {
       if (_confirmationTouched) return;
-      final joining = DateTime.tryParse(joiningDateController.text);
+      final apiDate = _toApi(joiningDateController.text);
+      final joining = DateTime.tryParse(apiDate);
       if (joining == null) return;
       final confirm = DateTime(joining.year, joining.month + 6, joining.day);
+      final pad = (int n) => n.toString().padLeft(2, '0');
+      // Store in DD-MM-YYYY
       confirmationDateController.text =
-          '${confirm.year}-${confirm.month.toString().padLeft(2, '0')}-'
-          '${confirm.day.toString().padLeft(2, '0')}';
+          '${pad(confirm.day)}-${pad(confirm.month)}-${confirm.year}';
     });
 
     // Live availability checks — fire (debounced) as the user types, so a
@@ -162,6 +245,54 @@ class AddEmployeeController extends GetxController {
     aadhaarController.addListener(_onAadhaarChanged);
     emailController.addListener(_onEmailChanged);
     phoneController.addListener(_onPhoneChanged);
+  }
+
+  // ── Input rules (controller-level) ────────────────────────────────────────
+  /// Forces the controller's text to UPPERCASE as the user types. Optionally
+  /// strips anything that is not A-Z / 0-9 and hard-caps the length.
+  void _forceUpper(TextEditingController c,
+      {int? maxLength, bool alphaNumOnly = false}) {
+    c.addListener(() {
+      final old = c.value;
+      var text = old.text.toUpperCase();
+      if (alphaNumOnly) text = text.replaceAll(RegExp(r'[^A-Z0-9]'), '');
+      if (maxLength != null && text.length > maxLength) {
+        text = text.substring(0, maxLength);
+      }
+      if (text == old.text) return;
+      if (text.length == old.text.length) {
+        // Only the letter case changed — keep cursor and IME state as-is.
+        c.value = old.copyWith(text: text);
+      } else {
+        final removed = old.text.length - text.length;
+        final offset =
+            (old.selection.baseOffset - removed).clamp(0, text.length).toInt();
+        c.value = TextEditingValue(
+          text: text,
+          selection: TextSelection.collapsed(offset: offset),
+        );
+      }
+    });
+  }
+
+  /// Keeps a date field in DD-MM-YYYY form while typing — digits only,
+  /// dashes inserted automatically after DD and MM, max 8 digits.
+  void _dateMask(TextEditingController c) {
+    c.addListener(() {
+      final old = c.text;
+      final digits = old.replaceAll(RegExp(r'[^0-9]'), '');
+      final buf = StringBuffer();
+      for (int i = 0; i < digits.length && i < 8; i++) {
+        if (i == 2 || i == 4) buf.write('-');
+        buf.write(digits[i]);
+      }
+      final text = buf.toString();
+      if (text == old) return;
+      c.value = TextEditingValue(
+        text: text,
+        selection: TextSelection.collapsed(offset: text.length),
+      );
+    });
   }
 
   // ── Live-check handlers ────────────────────────────────────────────────────
@@ -361,7 +492,6 @@ class AddEmployeeController extends GetxController {
     return '';
   }
 
-  void markCurrentAddressTouched() => _currentAddressTouched = true;
   void markConfirmationTouched() => _confirmationTouched = true;
 
   void setDocument(String key, File file) => documents[key] = file;
@@ -406,14 +536,18 @@ class AddEmployeeController extends GetxController {
       'email': emailController.text,
       'phone': phoneController.text,
       'secondaryPhone': secondaryPhoneController.text,
-      'dateOfBirth': dobController.text,
+      // A date only counts once fully typed as DD-MM-YYYY (10 chars).
+      'dateOfBirth':
+          dobController.text.length == 10 ? dobController.text : '',
       'gender': genderValue.value,
       'maritalStatus': maritalStatusValue.value,
       'bloodGroup': bloodGroupController.text,
       'caste': casteController.text,
       'permanentAddress': permanentAddressController.text,
       'currentAddress': currentAddressController.text,
-      'joiningDate': joiningDateController.text,
+      'joiningDate': joiningDateController.text.length == 10
+          ? joiningDateController.text
+          : '',
       'clientCompanyId': selectedClientId.value?.toString() ?? '',
       'branchId': selectedBranchId.value?.toString() ?? '',
       'departmentId': selectedDepartmentId.value?.toString() ?? '',
@@ -480,6 +614,11 @@ class AddEmployeeController extends GetxController {
     _setStep('core', 'Create employee record', 'RUNNING');
     int? newId;
     try {
+      // Convert DD-MM-YYYY display values back to YYYY-MM-DD for the API
+      final dobApi = _toApi(dobController.text.trim());
+      final joiningApi = _toApi(joiningDateController.text.trim());
+      final confirmApi = _toApi(confirmationDateController.text.trim());
+
       final payload = {
         'firstName': firstName,
         'lastName': lastName,
@@ -490,9 +629,7 @@ class AddEmployeeController extends GetxController {
         'phone': phoneController.text.trim().isNotEmpty
             ? phoneController.text.trim()
             : null,
-        'dateOfBirth': dobController.text.trim().isNotEmpty
-            ? dobController.text.trim()
-            : null,
+        'dateOfBirth': dobApi.isNotEmpty ? dobApi : null,
         'gender': genderValue.value.isNotEmpty ? genderValue.value : null,
         'bloodGroup': bloodGroupController.text.trim().isNotEmpty
             ? bloodGroupController.text.trim()
@@ -519,21 +656,15 @@ class AddEmployeeController extends GetxController {
             ? currentAddressController.text.trim()
             : null,
         'employmentType': employmentType.value,
-        'joiningDate': joiningDateController.text.trim().isNotEmpty
-            ? joiningDateController.text.trim()
-            : null,
-        'confirmationDate': confirmationDateController.text.trim().isNotEmpty
-            ? confirmationDateController.text.trim()
-            : null,
+        'joiningDate': joiningApi.isNotEmpty ? joiningApi : null,
+        'confirmationDate': confirmApi.isNotEmpty ? confirmApi : null,
         'designationId': selectedDesignationId.value,
         if (selectedClientId.value != null)
           'placement': {
             'clientCompanyId': selectedClientId.value,
             'branchId': selectedBranchId.value,
             'departmentId': selectedDepartmentId.value,
-            'startDate': joiningDateController.text.trim().isNotEmpty
-                ? joiningDateController.text.trim()
-                : null,
+            'startDate': joiningApi.isNotEmpty ? joiningApi : null,
           },
         'pan': panController.text.trim().isNotEmpty
             ? panController.text.trim()
@@ -759,13 +890,31 @@ class AddEmployeePage extends StatelessWidget {
     final ctrl = Get.put(AddEmployeeController());
     return Scaffold(
       backgroundColor: AppColors.background,
-      appBar: _buildAppBar(ctrl),
+      appBar: _buildAppBar(context, ctrl),
       body: _buildBody(ctrl),
       bottomNavigationBar: _buildFooter(context, ctrl),
     );
   }
 
-  PreferredSizeWidget _buildAppBar(AddEmployeeController ctrl) {
+  /// Leave Add Employee and land on the Dashboard.
+  ///
+  /// Inside MainShell this page is a tab of an IndexedStack, not a pushed
+  /// route, so Get.back() has nothing to pop and silently does nothing.
+  /// In that case switch the shell to tab 0 (Dashboard). If this page is
+  /// ever opened as its own route instead, pop it as before.
+  void _goToDashboard(BuildContext context) {
+    FocusScope.of(context).unfocus(); // close the keyboard first
+    final insideShell =
+        context.findAncestorWidgetOfExactType<IndexedStack>() != null;
+    if (!insideShell && Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+      return;
+    }
+    TabSwitcher.switchTo(0); // 0 = Dashboard tab in MainShell
+  }
+
+  PreferredSizeWidget _buildAppBar(
+      BuildContext context, AddEmployeeController ctrl) {
     return AppBar(
       backgroundColor: AppColors.surface,
       elevation: 0,
@@ -773,7 +922,7 @@ class AddEmployeePage extends StatelessWidget {
       shadowColor: AppColors.border,
       leading: IconButton(
         icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 18),
-        onPressed: Get.back,
+        onPressed: () => _goToDashboard(context),
       ),
       title: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -899,7 +1048,7 @@ class AddEmployeePage extends StatelessWidget {
         AppButton(
             label: 'Cancel',
             variant: AppButtonVariant.ghost,
-            onPressed: Get.back),
+            onPressed: () => _goToDashboard(context)),
         const SizedBox(width: 10),
         Expanded(
           child: Obx(() => AppButton(
@@ -1483,6 +1632,7 @@ class _PersonalInfoSection extends StatelessWidget {
   final AddEmployeeController ctrl;
   const _PersonalInfoSection({required this.ctrl});
 
+  // Open the date picker and write the selected date in DD-MM-YYYY format.
   Future<void> _pickDob(BuildContext context) async {
     final picked = await showDatePicker(
       context: context,
@@ -1496,9 +1646,9 @@ class _PersonalInfoSection extends StatelessWidget {
       ),
     );
     if (picked != null) {
+      final pad = (int n) => n.toString().padLeft(2, '0');
       ctrl.dobController.text =
-          '${picked.year}-${picked.month.toString().padLeft(2, '0')}-'
-          '${picked.day.toString().padLeft(2, '0')}';
+          '${pad(picked.day)}-${pad(picked.month)}-${picked.year}';
       ctrl.recomputeMissing();
     }
   }
@@ -1565,8 +1715,9 @@ class _PersonalInfoSection extends StatelessWidget {
         AppTextField(
             label: 'Full Name',
             controller: ctrl.fullNameController,
-            hint: 'Amit Kumar',
+            hint: 'AMIT KUMAR',
             required: true,
+            inputFormatters: [_UpperCaseFormatter()],
             onChanged: (_) => ctrl.recomputeMissing()),
         const SizedBox(height: 12),
         AppTextField(
@@ -1574,6 +1725,7 @@ class _PersonalInfoSection extends StatelessWidget {
             controller: ctrl.fatherHusbandNameController,
             hint: 'As on statutory records',
             required: req('fatherHusbandName'),
+            inputFormatters: [_UpperCaseFormatter()],
             onChanged: (_) => ctrl.recomputeMissing()),
         const SizedBox(height: 12),
         AppTextField(
@@ -1581,6 +1733,7 @@ class _PersonalInfoSection extends StatelessWidget {
             controller: ctrl.motherNameController,
             hint: 'As on statutory records',
             required: req('motherName'),
+            inputFormatters: [_UpperCaseFormatter()],
             onChanged: (_) => ctrl.recomputeMissing()),
         const SizedBox(height: 12),
         AppTextField(
@@ -1620,12 +1773,15 @@ class _PersonalInfoSection extends StatelessWidget {
             ],
             onChanged: (_) => ctrl.recomputeMissing()),
         const SizedBox(height: 12),
+        // ── Date of Birth — DD-MM-YYYY, typeable or picker ────────────────
         AppTextField(
             label: 'Date of Birth',
             controller: ctrl.dobController,
-            hint: 'YYYY-MM-DD',
+            hint: 'DD-MM-YYYY',
             required: true,
             helperText: 'Must be 18 years or older',
+            keyboardType: TextInputType.number,
+            inputFormatters: [_DateFormatter()],
             suffix: IconButton(
               icon: const Icon(Icons.calendar_today_rounded,
                   color: AppColors.textSecondary, size: 18),
@@ -1671,13 +1827,15 @@ class _PersonalInfoSection extends StatelessWidget {
             controller: ctrl.bloodGroupController,
             hint: 'e.g. O+, AB-',
             required: req('bloodGroup'),
+            inputFormatters: [_UpperCaseFormatter()],
             onChanged: (_) => ctrl.recomputeMissing()),
         const SizedBox(height: 12),
         AppTextField(
             label: 'Caste / Community',
             controller: ctrl.casteController,
-            hint: 'General / OBC / SC / ST',
+            hint: 'GENERAL / OBC / SC / ST',
             required: req('caste'),
+            inputFormatters: [_UpperCaseFormatter()],
             onChanged: (_) => ctrl.recomputeMissing()),
         const SizedBox(height: 12),
         AppTextField(
@@ -1686,18 +1844,71 @@ class _PersonalInfoSection extends StatelessWidget {
             hint: 'House / street / city / state / PIN',
             required: true,
             maxLines: 3,
+            inputFormatters: [_UpperCaseFormatter()],
             onChanged: (_) => ctrl.recomputeMissing()),
-        const SizedBox(height: 12),
-        AppTextField(
-            label: 'Current Address',
-            controller: ctrl.currentAddressController,
-            hint: 'Leave blank if same as permanent',
-            required: true,
-            maxLines: 3,
-            onChanged: (_) {
-              ctrl.markCurrentAddressTouched();
-              ctrl.recomputeMissing();
-            }),
+        const SizedBox(height: 8),
+        // ── "Same as permanent address" checkbox ──────────────────────────
+        // Unticked (default): both addresses are typed separately.
+        // Ticked: current address is copied from permanent and locked.
+        Obx(() => GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => ctrl.sameAsPermAddress.value =
+                  !ctrl.sameAsPermAddress.value,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(children: [
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 150),
+                  width: 20,
+                  height: 20,
+                  decoration: BoxDecoration(
+                    color: ctrl.sameAsPermAddress.value
+                        ? AppColors.accent
+                        : Colors.transparent,
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(
+                      color: ctrl.sameAsPermAddress.value
+                          ? AppColors.accent
+                          : AppColors.border,
+                      width: 1.5,
+                    ),
+                  ),
+                  child: ctrl.sameAsPermAddress.value
+                      ? const Icon(Icons.check_rounded,
+                          color: Colors.white, size: 13)
+                      : null,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text('Current address same as permanent address',
+                      style: AppTextStyles.bodySmall
+                          .copyWith(color: AppColors.textSecondary)),
+                ),
+              ]),
+              ),
+            )),
+        const SizedBox(height: 8),
+        Obx(() {
+          final same = ctrl.sameAsPermAddress.value;
+          // Locked (not tappable, dimmed) while the checkbox is ticked.
+          return AbsorbPointer(
+            absorbing: same,
+            child: Opacity(
+              opacity: same ? 0.6 : 1.0,
+              child: AppTextField(
+                label: 'Current Address',
+                controller: ctrl.currentAddressController,
+                hint: same
+                    ? 'Same as permanent address'
+                    : 'House / street / city / state / PIN',
+                required: true,
+                maxLines: 3,
+                inputFormatters: [_UpperCaseFormatter()],
+                onChanged: (_) => ctrl.recomputeMissing(),
+              ),
+            ),
+          );
+        }),
       ]);
     });
   }
@@ -1708,6 +1919,7 @@ class _JobDetailsSection extends StatelessWidget {
   final AddEmployeeController ctrl;
   const _JobDetailsSection({required this.ctrl});
 
+  // Open a date picker and write DD-MM-YYYY into the controller.
   Future<void> _pickDate(BuildContext context, TextEditingController c,
       {VoidCallback? onPicked}) async {
     final picked = await showDatePicker(
@@ -1722,8 +1934,9 @@ class _JobDetailsSection extends StatelessWidget {
       ),
     );
     if (picked != null) {
-      c.text = '${picked.year}-${picked.month.toString().padLeft(2, '0')}-'
-          '${picked.day.toString().padLeft(2, '0')}';
+      final pad = (int n) => n.toString().padLeft(2, '0');
+      c.text =
+          '${pad(picked.day)}-${pad(picked.month)}-${picked.year}';
       onPicked?.call();
     }
   }
@@ -1731,11 +1944,14 @@ class _JobDetailsSection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Column(children: [
+      // ── Joining Date — DD-MM-YYYY, typeable or picker ─────────────────
       AppTextField(
           label: 'Joining Date',
           controller: ctrl.joiningDateController,
-          hint: 'YYYY-MM-DD',
+          hint: 'DD-MM-YYYY',
           required: true,
+          keyboardType: TextInputType.number,
+          inputFormatters: [_DateFormatter()],
           suffix: IconButton(
             icon: const Icon(Icons.calendar_today_rounded,
                 color: AppColors.textSecondary, size: 18),
@@ -1744,11 +1960,14 @@ class _JobDetailsSection extends StatelessWidget {
           ),
           onChanged: (_) => ctrl.recomputeMissing()),
       const SizedBox(height: 12),
+      // ── Confirmation Date — DD-MM-YYYY, typeable or picker ────────────
       AppTextField(
           label: 'Confirmation Date',
           controller: ctrl.confirmationDateController,
           hint: 'Auto-set to joining + 6 months',
           helperText: 'Auto-computed — adjust if needed',
+          keyboardType: TextInputType.number,
+          inputFormatters: [_DateFormatter()],
           suffix: IconButton(
             icon: const Icon(Icons.calendar_today_rounded,
                 color: AppColors.textSecondary, size: 18),
@@ -1934,10 +2153,11 @@ class _BankTaxSection extends StatelessWidget {
           controller: ctrl.ifscController,
           hint: 'SBIN0001234',
           required: true,
-          helperText: 'Format: SBIN0001234',
+          helperText: 'Format: SBIN0001234 (11 characters)',
+          maxLength: 11, // hard stop at 11 characters
           inputFormatters: [
             FilteringTextInputFormatter.allow(RegExp(r'[A-Za-z0-9]')),
-            LengthLimitingTextInputFormatter(11),
+            LengthLimitingTextInputFormatter(11), // max 11 characters
             _UpperCaseFormatter(),
           ],
           onChanged: (_) => ctrl.recomputeMissing()),
@@ -1947,10 +2167,11 @@ class _BankTaxSection extends StatelessWidget {
             controller: ctrl.panController,
             hint: 'ABCDE1234F',
             required: isFieldRequired(ctrl.employmentType.value, 'pan'),
-            helperText: 'Format: ABCDE1234F',
+            helperText: 'Format: ABCDE1234F (10 characters)',
+            maxLength: 10, // hard stop at 10 characters
             inputFormatters: [
               FilteringTextInputFormatter.allow(RegExp(r'[A-Za-z0-9]')),
-              LengthLimitingTextInputFormatter(10),
+              LengthLimitingTextInputFormatter(10), // max 10 characters
               _UpperCaseFormatter(),
             ],
             onChanged: (_) => ctrl.recomputeMissing(),
@@ -1967,6 +2188,7 @@ class _BankTaxSection extends StatelessWidget {
           label: 'PF Account Number',
           controller: ctrl.pfController,
           hint: 'DL/CPM/1234567/000/0000123',
+          inputFormatters: [_UpperCaseFormatter()],
           helperText: 'Optional'),
       const SizedBox(height: 12),
       AppTextField(
@@ -2310,7 +2532,7 @@ class _FamilyMembersSection extends StatelessWidget {
     const maleRels = {'FATHER', 'SON', 'BROTHER'};
     const femaleRels = {'MOTHER', 'DAUGHTER', 'SISTER'};
 
-    // Native date picker for DOB (no more manual YYYY-MM-DD typing).
+    // Native date picker for DOB — writes DD-MM-YYYY into the controller.
     Future<void> pickDob() async {
       final now = DateTime.now();
       final picked = await showDatePicker(
@@ -2325,9 +2547,9 @@ class _FamilyMembersSection extends StatelessWidget {
         ),
       );
       if (picked != null) {
-        dobCtrl.text = '${picked.year}-'
-            '${picked.month.toString().padLeft(2, '0')}-'
-            '${picked.day.toString().padLeft(2, '0')}';
+        final pad = (int n) => n.toString().padLeft(2, '0');
+        dobCtrl.text =
+            '${pad(picked.day)}-${pad(picked.month)}-${picked.year}';
       }
     }
 
@@ -2382,16 +2604,19 @@ class _FamilyMembersSection extends StatelessWidget {
           const SizedBox(height: 12),
           TextField(
               controller: nameCtrl,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [_UpperCaseFormatter()],
               decoration: const InputDecoration(
                   labelText: 'Full Name *', border: OutlineInputBorder())),
           const SizedBox(height: 12),
-          // Read-only + calendar picker — DOB is no longer typed by hand.
+          // DOB — typeable (DD-MM-YYYY) or pick from calendar.
           TextField(
               controller: dobCtrl,
-              readOnly: true,
-              onTap: pickDob,
+              keyboardType: TextInputType.number,
+              inputFormatters: [_DateFormatter()],
               decoration: InputDecoration(
-                  labelText: 'Date of Birth *',
+                  labelText: 'Date of Birth (DD-MM-YYYY) *',
+                  hintText: 'DD-MM-YYYY',
                   border: const OutlineInputBorder(),
                   suffixIcon: IconButton(
                       icon: const Icon(Icons.calendar_today_rounded, size: 18),
@@ -2462,6 +2687,8 @@ class _FamilyMembersSection extends StatelessWidget {
           const SizedBox(height: 12),
           TextField(
               controller: notesCtrl,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [_UpperCaseFormatter()],
               decoration: const InputDecoration(
                   labelText: 'Notes', border: OutlineInputBorder()),
               maxLines: 2),
@@ -2476,18 +2703,28 @@ class _FamilyMembersSection extends StatelessWidget {
               style:
                   ElevatedButton.styleFrom(backgroundColor: AppColors.accent),
               onPressed: () {
-                final dob = dobCtrl.text.trim();
+                final dobDisplay = dobCtrl.text.trim();
+                // Convert DD-MM-YYYY → YYYY-MM-DD for the API payload
+                final dobApi = _toApi(dobDisplay);
                 final phone = phoneCtrl.text.trim();
                 final aadhaar = aadhaarCtrl.text.trim();
                 // DOB, phone and Aadhaar are now mandatory (alongside name +
                 // relationship).
                 if (nameCtrl.text.trim().isEmpty ||
                     relationship.value.isEmpty ||
-                    dob.isEmpty ||
+                    dobDisplay.isEmpty ||
                     phone.isEmpty ||
                     aadhaar.isEmpty) {
                   Get.snackbar('Missing',
                       'Name, relationship, date of birth, phone and Aadhaar are required',
+                      backgroundColor: AppColors.warning,
+                      colorText: Colors.white,
+                      snackPosition: SnackPosition.BOTTOM,
+                      margin: const EdgeInsets.all(16));
+                  return;
+                }
+                if (dobDisplay.length != 10) {
+                  Get.snackbar('Invalid', 'Date of birth must be DD-MM-YYYY',
                       backgroundColor: AppColors.warning,
                       colorText: Colors.white,
                       snackPosition: SnackPosition.BOTTOM,
@@ -2513,7 +2750,7 @@ class _FamilyMembersSection extends StatelessWidget {
                 ctrl.familyMembers.add({
                   'relationship': relationship.value,
                   'fullName': nameCtrl.text.trim(),
-                  'dateOfBirth': dob,
+                  'dateOfBirth': dobApi, // API receives YYYY-MM-DD
                   'gender': gender.value.isNotEmpty ? gender.value : null,
                   'occupation': null,
                   'phone': phone,
@@ -2635,11 +2872,15 @@ class _EmergencyContactsSection extends StatelessWidget {
           const SizedBox(height: 16),
           TextField(
               controller: nameCtrl,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [_UpperCaseFormatter()],
               decoration: const InputDecoration(
                   labelText: 'Contact Name *', border: OutlineInputBorder())),
           const SizedBox(height: 12),
           TextField(
               controller: relCtrl,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [_UpperCaseFormatter()],
               decoration: const InputDecoration(
                   labelText: 'Relationship *',
                   hintText: 'e.g. friend, neighbor',

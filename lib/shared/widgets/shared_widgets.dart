@@ -42,6 +42,9 @@ class SharedAppBar extends StatelessWidget implements PreferredSizeWidget {
   // Optional custom leading widget — takes priority over the hamburger.
   // Pass a back button on pushed routes so the user can pop the page.
   final Widget? leading;
+  // Optional bottom widget (e.g. a TabBar). When supplied it replaces the
+  // default 1px divider and its height is added to preferredSize.
+  final PreferredSizeWidget? bottom;
 
   const SharedAppBar({
     super.key,
@@ -51,10 +54,12 @@ class SharedAppBar extends StatelessWidget implements PreferredSizeWidget {
     this.showMenuButton = true,
     this.onMenuTap,
     this.leading,
+    this.bottom,
   });
 
   @override
-  Size get preferredSize => const Size.fromHeight(kToolbarHeight);
+  Size get preferredSize =>
+      Size.fromHeight(kToolbarHeight + (bottom?.preferredSize.height ?? 1));
 
   @override
   Widget build(BuildContext context) {
@@ -86,10 +91,11 @@ class SharedAppBar extends StatelessWidget implements PreferredSizeWidget {
         const ThemeToggleButton(),
         const SizedBox(width: 4),
       ],
-      bottom: PreferredSize(
-        preferredSize: const Size.fromHeight(1),
-        child: Divider(height: 1, color: t.border),
-      ),
+      bottom: bottom ??
+          PreferredSize(
+            preferredSize: const Size.fromHeight(1),
+            child: Divider(height: 1, color: t.border),
+          ),
     );
   }
 }

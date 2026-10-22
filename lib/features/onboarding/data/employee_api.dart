@@ -307,4 +307,39 @@ class EmployeeApi {
     final res = await _dio.get('/api/v1/me/bootstrap');
     return (res.data?['data'] as Map<String, dynamic>?) ?? {};
   }
+
+  // ── Attendance ledger (My Attendance month grid) ──────────────────────────
+  // GET /api/v1/attendance/ledger?employeeId&from&to
+  // Returns one entry PER CALENDAR DAY in the range:
+  //   { date, recorded, day: {...}|null, derivedStatus, anomalies: [] }
+  // `day` is the full attendance record when recorded == true; otherwise
+  // `derivedStatus` carries NO_RECORD / WEEK_OFF / FUTURE / HOLIDAY etc.
+  Future<List<dynamic>> getAttendanceLedger({
+    required int employeeId,
+    required String from,
+    required String to,
+  }) async {
+    final res = await _dio.get('/api/v1/attendance/ledger', queryParameters: {
+      'employeeId': employeeId,
+      'from': from,
+      'to': to,
+    });
+    return (res.data?['data'] as List?) ?? [];
+  }
+
+  // ── Monthly attendance summary ────────────────────────────────────────────
+  // GET /api/v1/attendance/{employeeId}/monthly-summary?month&year
+  // Returns: { totalWorkingDays, presentDays, absentDays, halfDays, lateDays,
+  //            leavesTaken, overtimeHours, paidDays, payableDays, lopDays, … }
+  Future<Map<String, dynamic>> getMonthlySummary(
+    int employeeId,
+    int month,
+    int year,
+  ) async {
+    final res = await _dio.get(
+      '/api/v1/attendance/$employeeId/monthly-summary',
+      queryParameters: {'month': month, 'year': year},
+    );
+    return (res.data?['data'] as Map<String, dynamic>?) ?? {};
+  }
 }
