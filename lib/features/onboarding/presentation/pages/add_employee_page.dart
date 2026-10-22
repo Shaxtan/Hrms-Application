@@ -62,6 +62,10 @@ class AddEmployeeController extends GetxController {
   final aadhaarConsentGiven = false.obs;
   final genderValue = ''.obs;
   final maritalStatusValue = ''.obs;
+  // Dropdown selections. The chosen value is also written into
+  // bloodGroupController / casteController, which the API payload reads.
+  final bloodGroupValue = ''.obs;
+  final casteValue = ''.obs;
   final bankNameValue = ''.obs;
   final profilePicture = Rxn<File>();
   final profilePictureBytes = Rxn<List<int>>(); // web-safe raw bytes
@@ -1822,21 +1826,49 @@ class _PersonalInfoSection extends StatelessWidget {
           onChanged: (v) => ctrl.maritalStatusValue.value = v ?? '',
         ),
         const SizedBox(height: 12),
-        AppTextField(
-            label: 'Blood Group',
-            controller: ctrl.bloodGroupController,
-            hint: 'e.g. O+, AB-',
-            required: req('bloodGroup'),
-            inputFormatters: [_UpperCaseFormatter()],
-            onChanged: (_) => ctrl.recomputeMissing()),
+        AppDropdown<String>(
+          label: 'Blood Group',
+          value: ctrl.bloodGroupValue.value.isEmpty
+              ? null
+              : ctrl.bloodGroupValue.value,
+          required: req('bloodGroup'),
+          hint: 'Select blood group',
+          items: const [
+            DropdownMenuItem(value: 'A+', child: Text('A+')),
+            DropdownMenuItem(value: 'A-', child: Text('A-')),
+            DropdownMenuItem(value: 'B+', child: Text('B+')),
+            DropdownMenuItem(value: 'B-', child: Text('B-')),
+            DropdownMenuItem(value: 'AB+', child: Text('AB+')),
+            DropdownMenuItem(value: 'AB-', child: Text('AB-')),
+            DropdownMenuItem(value: 'O+', child: Text('O+')),
+            DropdownMenuItem(value: 'O-', child: Text('O-')),
+          ],
+          onChanged: (v) {
+            ctrl.bloodGroupValue.value = v ?? '';
+            // Same controller the API payload already reads.
+            ctrl.bloodGroupController.text = v ?? '';
+            ctrl.recomputeMissing();
+          },
+        ),
         const SizedBox(height: 12),
-        AppTextField(
-            label: 'Caste / Community',
-            controller: ctrl.casteController,
-            hint: 'GENERAL / OBC / SC / ST',
-            required: req('caste'),
-            inputFormatters: [_UpperCaseFormatter()],
-            onChanged: (_) => ctrl.recomputeMissing()),
+        AppDropdown<String>(
+          label: 'Caste / Community',
+          value: ctrl.casteValue.value.isEmpty ? null : ctrl.casteValue.value,
+          required: req('caste'),
+          hint: 'Select caste / community',
+          items: const [
+            DropdownMenuItem(value: 'GENERAL', child: Text('General')),
+            DropdownMenuItem(value: 'OBC', child: Text('OBC')),
+            DropdownMenuItem(value: 'SC', child: Text('SC')),
+            DropdownMenuItem(value: 'ST', child: Text('ST')),
+          ],
+          onChanged: (v) {
+            ctrl.casteValue.value = v ?? '';
+            // Same controller the API payload already reads.
+            ctrl.casteController.text = v ?? '';
+            ctrl.recomputeMissing();
+          },
+        ),
         const SizedBox(height: 12),
         AppTextField(
             label: 'Permanent Address',

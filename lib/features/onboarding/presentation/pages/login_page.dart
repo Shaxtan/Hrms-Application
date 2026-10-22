@@ -164,6 +164,20 @@ class AuthController extends GetxController {
           : (parts.isNotEmpty ? parts[0][0].toUpperCase() : 'U');
 
       // Persist
+      // A new session starts here — clear the interceptor's session-expiry
+      // latch, otherwise the first genuine 401 of this session is swallowed.
+      ApiClient.resetSessionExpiry();
+
+      // The refresh token is normally an HttpOnly cookie (captured by the
+      // interceptor), but some deployments also return it in the body. On
+      // mobile a body token is the more reliable carrier, so keep it when
+      // it's there.
+      final bodyRefresh =
+          (data['refreshToken'] ?? body['refreshToken'])?.toString();
+      if (bodyRefresh != null && bodyRefresh.isNotEmpty) {
+        await _storage.write(key: 'refresh_token', value: bodyRefresh);
+      }
+
       await _storage.write(key: 'auth_token', value: token);
       if (tenantId != null)
         await _storage.write(key: 'tenant_id', value: tenantId);
