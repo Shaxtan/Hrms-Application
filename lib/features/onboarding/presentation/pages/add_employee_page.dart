@@ -12,6 +12,9 @@ import '../../../../core/network/api_client.dart';
 import '../../../../shared/widgets/shared_widgets.dart';
 import '../../data/employee_api.dart';
 import '../../domain/employee_models.dart';
+// Used only to refresh the Dashboard and Employees tabs after a create.
+import '../controllers/dashboard_controller.dart' show DashboardController;
+import 'employee_controller.dart' show EmployeeController;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // DATE HELPERS — display is DD-MM-YYYY; API payload is YYYY-MM-DD
@@ -176,7 +179,8 @@ class AddEmployeeController extends GetxController {
   final pfController = TextEditingController();
   final esicController = TextEditingController();
 
-  bool _confirmationTouched = false;
+  // Confirmation date disabled for now — uncomment to restore.
+  // bool _confirmationTouched = false;
 
   @override
   void onInit() {
@@ -227,11 +231,14 @@ class AddEmployeeController extends GetxController {
     _forceUpper(pfController);
     _forceUpper(ifscController, maxLength: 11, alphaNumOnly: true);
     _forceUpper(panController, maxLength: 10, alphaNumOnly: true);
+    _digitsOnly(uanController, maxLength: 12); // UAN = 12 digits
+    _digitsOnly(esicController, maxLength: 10); // ESIC = 10 digits
 
     // ── DD-MM-YYYY mask on every date field (typed input) ──────────────
     _dateMask(dobController);
     _dateMask(joiningDateController);
-    _dateMask(confirmationDateController);
+    // Confirmation date disabled for now — uncomment to restore.
+    // _dateMask(confirmationDateController);
 
     // Permanent address → copy into current ONLY while the
     // "same as permanent" checkbox is ticked. Unticked = fully independent.
@@ -258,19 +265,22 @@ class AddEmployeeController extends GetxController {
       recomputeMissing();
     });
 
-    // Joining date → auto-set confirmation date (+6 months).
-    // The controllers now store DD-MM-YYYY, so parse accordingly.
-    joiningDateController.addListener(() {
-      if (_confirmationTouched) return;
-      final apiDate = _toApi(joiningDateController.text);
-      final joining = DateTime.tryParse(apiDate);
-      if (joining == null) return;
-      final confirm = DateTime(joining.year, joining.month + 6, joining.day);
-      final pad = (int n) => n.toString().padLeft(2, '0');
-      // Store in DD-MM-YYYY
-      confirmationDateController.text =
-          '${pad(confirm.day)}-${pad(confirm.month)}-${confirm.year}';
-    });
+    // Confirmation date disabled for now — uncomment to restore.
+    // While disabled, confirmationDateController stays empty, so the
+    // existing payload sends 'confirmationDate': null.
+    // // Joining date → auto-set confirmation date (+6 months).
+    // // The controllers now store DD-MM-YYYY, so parse accordingly.
+    // joiningDateController.addListener(() {
+    //   if (_confirmationTouched) return;
+    //   final apiDate = _toApi(joiningDateController.text);
+    //   final joining = DateTime.tryParse(apiDate);
+    //   if (joining == null) return;
+    //   final confirm = DateTime(joining.year, joining.month + 6, joining.day);
+    //   final pad = (int n) => n.toString().padLeft(2, '0');
+    //   // Store in DD-MM-YYYY
+    //   confirmationDateController.text =
+    //       '${pad(confirm.day)}-${pad(confirm.month)}-${confirm.year}';
+    // });
 
     // Live availability checks — fire (debounced) as the user types, so a
     // duplicate Aadhaar / phone / email surfaces immediately instead of only
@@ -306,6 +316,25 @@ class AddEmployeeController extends GetxController {
           selection: TextSelection.collapsed(offset: offset),
         );
       }
+    });
+  }
+
+  /// Keeps only digits 0-9 in the controller and hard-caps the length.
+  /// Used for UAN (12) and ESIC (10). Works regardless of whether
+  /// AppTextField forwards inputFormatters.
+  void _digitsOnly(TextEditingController c, {required int maxLength}) {
+    c.addListener(() {
+      final old = c.value;
+      var text = old.text.replaceAll(RegExp(r'[^0-9]'), '');
+      if (text.length > maxLength) text = text.substring(0, maxLength);
+      if (text == old.text) return;
+      final removed = old.text.length - text.length;
+      final offset =
+          (old.selection.baseOffset - removed).clamp(0, text.length).toInt();
+      c.value = TextEditingValue(
+        text: text,
+        selection: TextSelection.collapsed(offset: offset),
+      );
     });
   }
 
@@ -614,7 +643,8 @@ class AddEmployeeController extends GetxController {
     return '';
   }
 
-  void markConfirmationTouched() => _confirmationTouched = true;
+  // Confirmation date disabled for now — uncomment to restore.
+  // void markConfirmationTouched() => _confirmationTouched = true;
 
   void setDocument(String key, File file) => documents[key] = file;
   void setDocumentBytes(String key, List<int> bytes, String name) {
@@ -680,7 +710,10 @@ class AddEmployeeController extends GetxController {
     };
 
     missingFields.value = requiredFieldKeys(type, hasClient: hasClient)
-        .where((k) => k != 'familyDetails' && (vals[k] ?? '').trim().isEmpty)
+        .where((k) =>
+            k != 'familyDetails' &&
+            k != 'departmentId' && // Department is optional
+            (vals[k] ?? '').trim().isEmpty)
         .toList();
 
     final reqDocs = <String>{...requiredDocKeys(type)};
@@ -971,7 +1004,26 @@ class AddEmployeeController extends GetxController {
     }
 
     submitting.value = false;
+
+    // The employee record exists now — refresh the Dashboard and Employees
+    // tabs, and switch to Employees behind the result sheet, so tapping
+    // Done lands on the updated list.
+    _refreshDashboardAndList();
+    TabSwitcher.switchTo(1); // 1 = Employees tab in MainShell
+
     _showSuccess();
+  }
+
+  /// Re-fetch Dashboard summary and the Employees list (same calls those
+  /// pages already make on load). Guards keep this safe if either isn't
+  /// registered yet.
+  void _refreshDashboardAndList() {
+    if (Get.isRegistered<DashboardController>()) {
+      Get.find<DashboardController>().load();
+    }
+    if (Get.isRegistered<EmployeeController>()) {
+      Get.find<EmployeeController>().fetchEmployees();
+    }
   }
 
   void _setStep(String key, String label, String status, {String? error}) {
@@ -2112,22 +2164,23 @@ class _JobDetailsSection extends StatelessWidget {
           ),
           onChanged: (_) => ctrl.recomputeMissing()),
       const SizedBox(height: 12),
-      // ── Confirmation Date — DD-MM-YYYY, typeable or picker ────────────
-      AppTextField(
-          label: 'Confirmation Date',
-          controller: ctrl.confirmationDateController,
-          hint: 'Auto-set to joining + 6 months',
-          helperText: 'Auto-computed — adjust if needed',
-          keyboardType: TextInputType.number,
-          inputFormatters: [_DateFormatter()],
-          suffix: IconButton(
-            icon: const Icon(Icons.calendar_today_rounded,
-                color: AppColors.textSecondary, size: 18),
-            onPressed: () => _pickDate(context, ctrl.confirmationDateController,
-                onPicked: ctrl.markConfirmationTouched),
-          ),
-          onChanged: (_) => ctrl.markConfirmationTouched()),
-      const SizedBox(height: 12),
+      // Confirmation date disabled for now — uncomment to restore.
+      // // ── Confirmation Date — DD-MM-YYYY, typeable or picker ────────────
+      // AppTextField(
+      //     label: 'Confirmation Date',
+      //     controller: ctrl.confirmationDateController,
+      //     hint: 'Auto-set to joining + 6 months',
+      //     helperText: 'Auto-computed — adjust if needed',
+      //     keyboardType: TextInputType.number,
+      //     inputFormatters: [_DateFormatter()],
+      //     suffix: IconButton(
+      //       icon: const Icon(Icons.calendar_today_rounded,
+      //           color: AppColors.textSecondary, size: 18),
+      //       onPressed: () => _pickDate(context, ctrl.confirmationDateController,
+      //           onPicked: ctrl.markConfirmationTouched),
+      //     ),
+      //     onChanged: (_) => ctrl.markConfirmationTouched()),
+      // const SizedBox(height: 12),
 
       // ── Client ── (API: POST /api/v1/client-companies/list) ──────────────
       Obx(() {
@@ -2199,7 +2252,7 @@ class _JobDetailsSection extends StatelessWidget {
         return AppDropdown<int>(
           label: 'Department',
           value: ctrl.selectedDepartmentId.value,
-          required: true,
+          required: false, // Department is optional
           enabled: branchPicked && !loading,
           hint: !branchPicked
               ? 'Select branch first'
@@ -2207,7 +2260,7 @@ class _JobDetailsSection extends StatelessWidget {
                   ? 'Loading departments…'
                   : (items.isEmpty
                       ? 'No departments for this branch'
-                      : 'Select department')),
+                      : 'Select department (optional)')),
           items: items
               .map((d) => DropdownMenuItem<int>(
                     value: d.id,
@@ -2328,7 +2381,12 @@ class _BankTaxSection extends StatelessWidget {
           controller: ctrl.uanController,
           hint: '100123456789',
           keyboardType: TextInputType.number,
-          helperText: 'Optional'),
+          maxLength: 12, // hard stop at 12 digits
+          inputFormatters: [
+            FilteringTextInputFormatter.digitsOnly,
+            LengthLimitingTextInputFormatter(12),
+          ],
+          helperText: 'Optional — 12 digits'),
       const SizedBox(height: 12),
       AppTextField(
           label: 'PF Account Number',
@@ -2342,7 +2400,12 @@ class _BankTaxSection extends StatelessWidget {
           controller: ctrl.esicController,
           hint: '3112345678',
           keyboardType: TextInputType.number,
-          helperText: 'Optional'),
+          maxLength: 10, // hard stop at 10 digits
+          inputFormatters: [
+            FilteringTextInputFormatter.digitsOnly,
+            LengthLimitingTextInputFormatter(10),
+          ],
+          helperText: 'Optional — 10 digits'),
     ]);
   }
 }
@@ -2677,8 +2740,8 @@ class _SuccessSheet extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(vertical: 14),
               ),
               onPressed: () {
-                Get.back();
-                Get.back();
+                Get.back(); // close this sheet
+                TabSwitcher.switchTo(1); // stay on the Employees list
               },
               child: Text('Done',
                   style:

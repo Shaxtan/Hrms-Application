@@ -59,7 +59,7 @@ class _SearchBar extends StatelessWidget {
           },
           style: AppTextStyles.bodyMedium.copyWith(color: t.textPrimary),
           decoration: InputDecoration(
-            hintText: 'Search name, code, branch…',
+            hintText: 'Search name, code, mobile, branch…',
             hintStyle: AppTextStyles.bodyMedium.copyWith(color: t.textTert),
             prefixIcon: Icon(Icons.search_rounded, color: t.textTert, size: 20),
             filled: true,
