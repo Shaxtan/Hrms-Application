@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 // hide Response/FormData/MultipartFile — dio owns these types here.
 import 'package:get/get.dart' hide Response, FormData, MultipartFile;
@@ -117,12 +118,36 @@ class ApiClient {
         'Accept': 'application/json'
       },
     ));
+    enableBrowserCredentials(_dio);
     _dio.interceptors.addAll([
       _ServiceRouterInterceptor(),
       _AuthInterceptor(),
       _LoggingInterceptor(_logger),
     ]);
   }
+
+  /// The refresh token is an **HttpOnly cookie** issued by the Auth Service at
+  /// login — the login response body never contains it (same as the web
+  /// portal). On Flutter Web the browser will only send that cookie
+  /// cross-origin when the XHR has `withCredentials`, so turn it on. Without
+  /// this every /auth/refresh call arrives with no credential and fails,
+  /// which forced a logout on the first 401 after the access token expired.
+  ///
+  /// Accessed dynamically so this file still compiles for Android/iOS, where
+  /// the adapter has no `withCredentials` property.
+  static void enableBrowserCredentials(Dio dio) {
+    if (!kIsWeb) return;
+    try {
+      (dio.httpClientAdapter as dynamic).withCredentials = true;
+    } catch (_) {
+      // Adapter doesn't expose it — nothing to do.
+    }
+  }
+
+  /// Re-arm the interceptor after a successful login. The session-expiry latch
+  /// below is sticky by design, so it must be cleared when a new session
+  /// starts or the very first 401 of that session would be swallowed.
+  static void resetSessionExpiry() => _AuthInterceptor.resetSessionExpiry();
 
   static Dio get instance => _dio;
 
@@ -202,6 +227,20 @@ class _AuthInterceptor extends Interceptor {
   final List<({RequestOptions options, ErrorInterceptorHandler handler})>
       _failedQueue = [];
 
+  /// Sticky latch — once a session expiry has been handled, every later 401 is
+  /// dropped silently instead of triggering another wipe + redirect.
+  ///
+  /// why: when the access token expires the app usually has several requests
+  /// in flight (dashboard summary, employee list, attendance, approvals…).
+  /// Each one 401s. Without this latch each of those independently ran the
+  /// refresh → fail → deleteAll → Get.offAllNamed('/login') path, so the user
+  /// was bounced to the login screen several times in a row — the "app
+  /// refreshing randomly" symptom. The web portal solves this exact problem
+  /// with its `sessionExpiredHandled` flag; this mirrors it.
+  static bool _sessionExpired = false;
+
+  static void resetSessionExpiry() => _sessionExpired = false;
+
   @override
   void onRequest(
       RequestOptions options, RequestInterceptorHandler handler) async {
@@ -221,56 +260,143 @@ class _AuthInterceptor extends Interceptor {
   }
 
   @override
+  void onResponse(Response response, ResponseInterceptorHandler handler) async {
+    // Capture the refresh cookie on mobile. Browsers hide Set-Cookie from JS
+    // (there the HttpOnly cookie is replayed automatically by
+    // withCredentials), but on Android/iOS Dio has no cookie store at all, so
+    // we persist it ourselves and replay it on /auth/refresh.
+    if (!kIsWeb) {
+      final cookies = response.headers.map['set-cookie'];
+      if (cookies != null) {
+        for (final c in cookies) {
+          final m = RegExp(r'refreshToken=([^;]+)').firstMatch(c);
+          if (m != null) {
+            await _storage.write(key: 'refresh_token', value: m.group(1));
+            break;
+          }
+        }
+      }
+    }
+    handler.next(response);
+  }
+
+  @override
   void onError(DioException err, ErrorInterceptorHandler handler) async {
-    if (err.response?.statusCode != 401 || _isPublic(err.requestOptions.path)) {
+    final isAuthError = err.response?.statusCode == 401;
+    if (!isAuthError || _isPublic(err.requestOptions.path)) {
       handler.next(err);
       return;
     }
+
+    // Session already declared dead — swallow the rest of the 401 burst
+    // instead of wiping storage and redirecting once per failed request.
+    if (_sessionExpired) {
+      handler.next(err);
+      return;
+    }
+
+    // Never retry the same request twice (mirrors the web's `_retry` flag).
+    if (err.requestOptions.extra['__retried'] == true) {
+      await _expireSession();
+      handler.next(err);
+      return;
+    }
+
     if (_isRefreshing) {
       _failedQueue.add((options: err.requestOptions, handler: handler));
       return;
     }
+
     _isRefreshing = true;
+    // Guards against completing `handler` twice if anything after the retry
+    // throws — a handler may only be resolved or rejected once.
+    var resolved = false;
     try {
-      final refreshDio = Dio(BaseOptions(
-          baseUrl: ApiClient.authBaseUrl,
-          connectTimeout: const Duration(seconds: 15)));
-      final res = await refreshDio.post('/api/v1/auth/refresh', data: {});
-      final newToken = res.data?['data']?['accessToken'] as String?;
-      if (newToken == null) throw Exception('No accessToken');
+      final newToken = await _performRefresh();
+      if (newToken == null || newToken.isEmpty) {
+        throw Exception('Refresh did not return an access token');
+      }
       await _storage.write(key: 'auth_token', value: newToken);
-      // Retry original
+
+      // Retry the original request once, through the configured client so the
+      // service-router and logging interceptors still apply.
       err.requestOptions.headers['Authorization'] = 'Bearer $newToken';
-      final base = ApiClient.resolveServiceUrl(err.requestOptions.path);
-      if (base != null) err.requestOptions.baseUrl = base;
-      handler.resolve(await Dio().fetch(err.requestOptions));
+      err.requestOptions.extra['__retried'] = true;
+      final retried = await ApiClient.instance.fetch(err.requestOptions);
+      resolved = true;
+      handler.resolve(retried);
+
       for (final q in _failedQueue) {
         q.options.headers['Authorization'] = 'Bearer $newToken';
-        final qBase = ApiClient.resolveServiceUrl(q.options.path);
-        if (qBase != null) q.options.baseUrl = qBase;
+        q.options.extra['__retried'] = true;
         try {
-          q.handler.resolve(await Dio().fetch(q.options));
+          q.handler.resolve(await ApiClient.instance.fetch(q.options));
         } catch (e) {
-          q.handler.reject(DioException(requestOptions: q.options, error: e));
+          q.handler.reject(e is DioException
+              ? e
+              : DioException(requestOptions: q.options, error: e));
         }
       }
     } catch (_) {
-      // Refresh failed — session is dead. Wipe local state and force the user
-      // back to the login screen exactly like AuthController.logout() does.
-      // why: without this, a 401 leaves the user staring at a page whose data
-      //      never arrives (calls silently fail), with no clear path back.
-      await _storage.deleteAll();
-      handler.next(err);
-      for (final q in _failedQueue) q.handler.next(err);
-      _redirectToLogin();
+      // Refresh is not possible (expired / missing refresh cookie). Wipe the
+      // session once and send the user to login — exactly once, thanks to the
+      // latch set inside _expireSession().
+      await _expireSession();
+      if (!resolved) handler.next(err);
+      for (final q in _failedQueue) {
+        q.handler.next(err);
+      }
     } finally {
       _isRefreshing = false;
       _failedQueue.clear();
     }
   }
 
-  // Only redirect once, and never redirect while the user is already on /login
-  // (avoids fighting a fresh login attempt whose own 401 arrives seconds later).
+  /// POST /api/v1/auth/refresh carrying whatever credential this platform has.
+  /// Returns null when there is nothing to send, so the caller fails fast
+  /// instead of burning a round-trip that can never succeed.
+  Future<String?> _performRefresh() async {
+    final stored = await _storage.read(key: 'refresh_token');
+
+    // On web the browser replays the HttpOnly cookie itself (withCredentials),
+    // so an empty store is fine. On mobile, no captured cookie means refresh
+    // is impossible — don't call the endpoint at all.
+    if (!kIsWeb && (stored == null || stored.isEmpty)) return null;
+
+    final refreshDio = Dio(BaseOptions(
+      baseUrl: ApiClient.authBaseUrl,
+      connectTimeout: const Duration(seconds: 15),
+      receiveTimeout: const Duration(seconds: 15),
+    ));
+    ApiClient.enableBrowserCredentials(refreshDio);
+
+    // Forward the active branch so the re-issued token keeps the current
+    // branch scope instead of resetting to the home branch (web parity).
+    final branchId = await _storage.read(key: 'branch_id');
+
+    final res = await refreshDio.post(
+      '/api/v1/auth/refresh',
+      data: const <String, dynamic>{},
+      options: Options(headers: {
+        if (!kIsWeb && stored != null) 'Cookie': 'refreshToken=$stored',
+        if (branchId != null) 'X-Branch-ID': branchId,
+      }),
+    );
+    return res.data?['data']?['accessToken'] as String?;
+  }
+
+  /// Idempotent "the session is over" handler: latch, clear storage, redirect
+  /// once. Every later 401 short-circuits on the latch.
+  Future<void> _expireSession() async {
+    if (_sessionExpired) return;
+    _sessionExpired = true;
+    try {
+      await _storage.deleteAll();
+    } catch (_) {}
+    _redirectToLogin();
+  }
+
+  // Never redirect while the user is already on /login.
   void _redirectToLogin() {
     try {
       final current = Get.currentRoute;
