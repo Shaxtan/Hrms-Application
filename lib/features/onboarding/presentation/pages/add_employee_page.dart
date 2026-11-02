@@ -98,12 +98,39 @@ class AddEmployeeController extends GetxController {
   final emailCheckState = 'IDLE'.obs;
   final phoneCheckState = 'IDLE'.obs;
 
+  // IFSC directory lookup: IDLE | CHECKING | FOUND | NOT_FOUND | ERROR
+  final ifscCheckState = 'IDLE'.obs;
+  final ifscDetails = Rxn<Map<String, dynamic>>();
+
   Timer? _aadhaarDebounce;
   Timer? _emailDebounce;
   Timer? _phoneDebounce;
+  Timer? _ifscDebounce;
   // Stale-response guards: a slow older response can't overwrite a newer one.
-  int _aadhaarSeq = 0, _emailSeq = 0, _phoneSeq = 0;
+  int _aadhaarSeq = 0, _emailSeq = 0, _phoneSeq = 0, _ifscSeq = 0;
   static final _emailRe = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$');
+  // Same rule the web portal validates with: AAAA0XXXXXX (11 chars).
+  static final _ifscRe = RegExp(r'^[A-Z]{4}0[A-Z0-9]{6}$');
+
+  /// Bank options for the Bank Name dropdown. Lives on the controller so the
+  /// IFSC auto-fill can map an API bank name onto one of these entries.
+  static const bankOptions = [
+    'State Bank of India',
+    'HDFC Bank',
+    'ICICI Bank',
+    'Axis Bank',
+    'Kotak Mahindra Bank',
+    'Punjab National Bank',
+    'Bank of Baroda',
+    'Canara Bank',
+    'Union Bank of India',
+    'IndusInd Bank',
+    'Yes Bank',
+    'IDFC First Bank',
+    'Federal Bank',
+    'South Indian Bank',
+    'Other',
+  ];
 
   final _api = EmployeeApi();
 
@@ -142,6 +169,8 @@ class AddEmployeeController extends GetxController {
   final designationController = TextEditingController();
   final bankAccountController = TextEditingController();
   final ifscController = TextEditingController();
+  // Auto-filled from the IFSC lookup; stays editable.
+  final bankBranchController = TextEditingController();
   final panController = TextEditingController();
   final uanController = TextEditingController();
   final pfController = TextEditingController();
@@ -249,6 +278,7 @@ class AddEmployeeController extends GetxController {
     aadhaarController.addListener(_onAadhaarChanged);
     emailController.addListener(_onEmailChanged);
     phoneController.addListener(_onPhoneChanged);
+    ifscController.addListener(_onIfscChanged);
   }
 
   // ── Input rules (controller-level) ────────────────────────────────────────
@@ -374,12 +404,100 @@ class AddEmployeeController extends GetxController {
     });
   }
 
+  // ── IFSC directory lookup ────────────────────────────────────────────────
+  // Fires once the field holds a well-formed IFSC (AAAA0XXXXXX). On a hit the
+  // bank name and branch are filled in for the user; both stay editable.
+  void _onIfscChanged() {
+    _ifscDebounce?.cancel();
+    final v = ifscController.text.trim().toUpperCase();
+    if (!_ifscRe.hasMatch(v)) {
+      // Half-typed or invalid — clear any previous result so a stale bank
+      // name can't linger next to a different code.
+      ifscCheckState.value = 'IDLE';
+      ifscDetails.value = null;
+      return;
+    }
+    ifscCheckState.value = 'CHECKING';
+    final seq = ++_ifscSeq;
+    _ifscDebounce = Timer(const Duration(milliseconds: 500), () async {
+      try {
+        final d = await _api.verifyIfsc(v);
+        if (seq != _ifscSeq) return;
+        if (d.isEmpty) {
+          ifscCheckState.value = 'NOT_FOUND';
+          ifscDetails.value = null;
+          return;
+        }
+        ifscDetails.value = d;
+        ifscCheckState.value = 'FOUND';
+        _applyIfscDetails(d);
+      } on DioException catch (e) {
+        if (seq != _ifscSeq) return;
+        // 404 = IFSC genuinely not in the directory; anything else is a
+        // transport/server problem the user shouldn't be blamed for.
+        ifscCheckState.value =
+            e.response?.statusCode == 404 ? 'NOT_FOUND' : 'ERROR';
+        ifscDetails.value = null;
+      } catch (_) {
+        if (seq != _ifscSeq) return;
+        ifscCheckState.value = 'ERROR';
+        ifscDetails.value = null;
+      }
+    });
+  }
+
+  /// Fill Bank Name + Branch Name from a successful lookup.
+  void _applyIfscDetails(Map<String, dynamic> d) {
+    final branch = (d['branchName'] ?? '').toString().trim();
+    if (branch.isNotEmpty) bankBranchController.text = branch;
+
+    final apiBank = (d['bankName'] ?? '').toString().trim();
+    if (apiBank.isEmpty) return;
+    // The dropdown is a fixed list, so map the API's name onto an entry.
+    // Exact match first, then a loose contains match ("State Bank of India"
+    // vs "STATE BANK OF INDIA"), else fall back to 'Other' so the required
+    // field is still satisfied.
+    final lower = apiBank.toLowerCase();
+    final match = bankOptions.firstWhere(
+      (b) => b.toLowerCase() == lower,
+      orElse: () => bankOptions.firstWhere(
+        (b) =>
+            b != 'Other' &&
+            (lower.contains(b.toLowerCase()) ||
+                b.toLowerCase().contains(lower)),
+        orElse: () => 'Other',
+      ),
+    );
+    bankNameValue.value = match;
+    recomputeMissing();
+  }
+
+  /// One-line summary shown under the IFSC field, mirroring the web portal:
+  /// "State Bank of India · HAJIGANJ, PATNA (BIHAR)".
+  String get ifscSummary {
+    final d = ifscDetails.value;
+    if (d == null) return '';
+    final bank = (d['bankName'] ?? '').toString().trim();
+    final branch = (d['branchName'] ?? '').toString().trim();
+    final city = (d['city'] ?? '').toString().trim();
+    final state = (d['state'] ?? '').toString().trim();
+    final where = [
+      if (branch.isNotEmpty) branch,
+      if (city.isNotEmpty) city,
+    ].join(', ');
+    final tail = state.isNotEmpty ? '$where ($state)' : where;
+    if (bank.isEmpty) return tail;
+    return tail.isEmpty ? bank : '$bank · $tail';
+  }
+
   @override
   void onClose() {
     _aadhaarDebounce?.cancel();
     _emailDebounce?.cancel();
     _phoneDebounce?.cancel();
+    _ifscDebounce?.cancel();
     for (final c in [
+      bankBranchController,
       aadhaarController,
       fullNameController,
       fatherHusbandNameController,
@@ -541,8 +659,7 @@ class AddEmployeeController extends GetxController {
       'phone': phoneController.text,
       'secondaryPhone': secondaryPhoneController.text,
       // A date only counts once fully typed as DD-MM-YYYY (10 chars).
-      'dateOfBirth':
-          dobController.text.length == 10 ? dobController.text : '',
+      'dateOfBirth': dobController.text.length == 10 ? dobController.text : '',
       'gender': genderValue.value,
       'maritalStatus': maritalStatusValue.value,
       'bloodGroup': bloodGroupController.text,
@@ -719,11 +836,15 @@ class AddEmployeeController extends GetxController {
     if (bankAccountController.text.trim().isNotEmpty) {
       _setStep('bank', 'Add bank account', 'RUNNING');
       try {
+        final branch = bankBranchController.text.trim();
         await _api.addBankAccount(newId, {
           'accountHolderName': fullName,
           'accountNumber': bankAccountController.text.trim(),
           'bankName': bankNameValue.value,
-          'ifscCode': ifscController.text.trim(),
+          'ifscCode': ifscController.text.trim().toUpperCase(),
+          // Auto-filled from the IFSC lookup; omitted when it stayed empty so
+          // we never send a null the DTO may reject.
+          if (branch.isNotEmpty) 'branchName': branch,
           'accountType': 'SAVINGS',
           'isPrimary': true,
         });
@@ -1884,39 +2005,39 @@ class _PersonalInfoSection extends StatelessWidget {
         // Ticked: current address is copied from permanent and locked.
         Obx(() => GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTap: () => ctrl.sameAsPermAddress.value =
-                  !ctrl.sameAsPermAddress.value,
+              onTap: () =>
+                  ctrl.sameAsPermAddress.value = !ctrl.sameAsPermAddress.value,
               child: Padding(
                 padding: const EdgeInsets.symmetric(vertical: 4),
                 child: Row(children: [
-                AnimatedContainer(
-                  duration: const Duration(milliseconds: 150),
-                  width: 20,
-                  height: 20,
-                  decoration: BoxDecoration(
-                    color: ctrl.sameAsPermAddress.value
-                        ? AppColors.accent
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(4),
-                    border: Border.all(
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 150),
+                    width: 20,
+                    height: 20,
+                    decoration: BoxDecoration(
                       color: ctrl.sameAsPermAddress.value
                           ? AppColors.accent
-                          : AppColors.border,
-                      width: 1.5,
+                          : Colors.transparent,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: ctrl.sameAsPermAddress.value
+                            ? AppColors.accent
+                            : AppColors.border,
+                        width: 1.5,
+                      ),
                     ),
+                    child: ctrl.sameAsPermAddress.value
+                        ? const Icon(Icons.check_rounded,
+                            color: Colors.white, size: 13)
+                        : null,
                   ),
-                  child: ctrl.sameAsPermAddress.value
-                      ? const Icon(Icons.check_rounded,
-                          color: Colors.white, size: 13)
-                      : null,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text('Current address same as permanent address',
-                      style: AppTextStyles.bodySmall
-                          .copyWith(color: AppColors.textSecondary)),
-                ),
-              ]),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text('Current address same as permanent address',
+                        style: AppTextStyles.bodySmall
+                            .copyWith(color: AppColors.textSecondary)),
+                  ),
+                ]),
               ),
             )),
         const SizedBox(height: 8),
@@ -1967,8 +2088,7 @@ class _JobDetailsSection extends StatelessWidget {
     );
     if (picked != null) {
       final pad = (int n) => n.toString().padLeft(2, '0');
-      c.text =
-          '${pad(picked.day)}-${pad(picked.month)}-${picked.year}';
+      c.text = '${pad(picked.day)}-${pad(picked.month)}-${picked.year}';
       onPicked?.call();
     }
   }
@@ -2137,23 +2257,9 @@ class _BankTaxSection extends StatelessWidget {
   final AddEmployeeController ctrl;
   const _BankTaxSection({required this.ctrl});
 
-  static const _banks = [
-    'State Bank of India',
-    'HDFC Bank',
-    'ICICI Bank',
-    'Axis Bank',
-    'Kotak Mahindra Bank',
-    'Punjab National Bank',
-    'Bank of Baroda',
-    'Canara Bank',
-    'Union Bank of India',
-    'IndusInd Bank',
-    'Yes Bank',
-    'IDFC First Bank',
-    'Federal Bank',
-    'South Indian Bank',
-    'Other',
-  ];
+  // The list lives on the controller so the IFSC auto-fill can map an API bank
+  // name onto exactly the same entries this dropdown offers.
+  static const _banks = AddEmployeeController.bankOptions;
 
   @override
   Widget build(BuildContext context) {
@@ -2193,6 +2299,14 @@ class _BankTaxSection extends StatelessWidget {
             _UpperCaseFormatter(),
           ],
           onChanged: (_) => ctrl.recomputeMissing()),
+      // Live IFSC directory lookup — fills Bank Name + Branch below.
+      _IfscStatus(ctrl: ctrl),
+      const SizedBox(height: 12),
+      AppTextField(
+          label: 'Branch Name',
+          controller: ctrl.bankBranchController,
+          hint: 'Filled in from the IFSC',
+          helperText: 'Optional — filled in from the IFSC when it is found'),
       const SizedBox(height: 12),
       Obx(() => AppTextField(
             label: 'PAN Number',
@@ -2230,6 +2344,103 @@ class _BankTaxSection extends StatelessWidget {
           keyboardType: TextInputType.number,
           helperText: 'Optional'),
     ]);
+  }
+}
+
+/// Reference line shown under the IFSC field, mirroring the web portal:
+///
+///   State Bank of India · HAJIGANJ, PATNA (BIHAR)
+///   branch details from the IFSC directory; the account itself is not verified.
+///
+/// Renders nothing until a syntactically valid IFSC has been typed and the
+/// lookup has fired, so a half-typed code never shows an error.
+class _IfscStatus extends StatelessWidget {
+  final AddEmployeeController ctrl;
+  const _IfscStatus({required this.ctrl});
+
+  @override
+  Widget build(BuildContext context) {
+    return Obx(() {
+      final state = ctrl.ifscCheckState.value;
+      if (state == 'IDLE') return const SizedBox.shrink();
+
+      // CHECKING — spinner only, no verdict yet.
+      if (state == 'CHECKING') {
+        return Padding(
+          padding: const EdgeInsets.only(top: 8, left: 4),
+          child: Row(children: [
+            SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: const AlwaysStoppedAnimation<Color>(
+                        AppColors.textTertiary))),
+            const SizedBox(width: 6),
+            Text('Looking up IFSC…',
+                style: AppTextStyles.caption.copyWith(
+                    color: AppColors.textTertiary,
+                    fontWeight: FontWeight.w500)),
+          ]),
+        );
+      }
+
+      // FOUND — bank/branch summary plus the "IFSC only" disclaimer.
+      if (state == 'FOUND') {
+        return Padding(
+          padding: const EdgeInsets.only(top: 8, left: 4),
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Icon(Icons.check_circle_rounded,
+                size: 15, color: AppColors.success),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(ctrl.ifscSummary,
+                      style: AppTextStyles.caption.copyWith(
+                          color: AppColors.success,
+                          fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 2),
+                  Text(
+                      'Branch details from the IFSC directory; the account '
+                      'itself is not verified.',
+                      style: AppTextStyles.caption
+                          .copyWith(color: AppColors.textTertiary)),
+                ],
+              ),
+            ),
+          ]),
+        );
+      }
+
+      // NOT_FOUND / ERROR — never blocks submit; the backend validates again.
+      final notFound = state == 'NOT_FOUND';
+      return Padding(
+        padding: const EdgeInsets.only(top: 8, left: 4),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(
+              notFound
+                  ? Icons.error_outline_rounded
+                  : Icons.info_outline_rounded,
+              size: 15,
+              color: notFound ? AppColors.warning : AppColors.textTertiary),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+                notFound
+                    ? "This IFSC isn't in the directory — check the code, or "
+                        'fill the bank details in yourself.'
+                    : "Couldn't look up the IFSC right now — you can still "
+                        'fill the bank details in yourself.',
+                style: AppTextStyles.caption.copyWith(
+                    color:
+                        notFound ? AppColors.warning : AppColors.textTertiary,
+                    fontWeight: FontWeight.w500)),
+          ),
+        ]),
+      );
+    });
   }
 }
 
@@ -2580,8 +2791,7 @@ class _FamilyMembersSection extends StatelessWidget {
       );
       if (picked != null) {
         final pad = (int n) => n.toString().padLeft(2, '0');
-        dobCtrl.text =
-            '${pad(picked.day)}-${pad(picked.month)}-${picked.year}';
+        dobCtrl.text = '${pad(picked.day)}-${pad(picked.month)}-${picked.year}';
       }
     }
 

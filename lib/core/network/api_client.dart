@@ -81,6 +81,9 @@ class ApiClient {
     ['/api/v1/admin', 'SETTINGS'],
     ['/api/v1/jobs', 'SETTINGS'],
     ['/api/v1/settings', 'SETTINGS'],
+    // IFSC / bank lookups live on the platform module (8090). Without this
+    // entry resolveServiceUrl() returns null and the call has no base URL.
+    ['/api/v1/verifications', 'SETTINGS'],
     ['/api/v1/reports', 'REPORT'],
   ];
 

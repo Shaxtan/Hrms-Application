@@ -342,4 +342,16 @@ class EmployeeApi {
     );
     return (res.data?['data'] as Map<String, dynamic>?) ?? {};
   }
+
+  // ── IFSC lookup ───────────────────────────────────────────────────────────
+  // GET /api/v1/verifications/ifsc/{ifsc}
+  // Returns bank + branch details for a valid IFSC:
+  //   { ifsc, bankCode, bankName, branchName, address, city, district, state,
+  //     phone, micr, swift, paymentModes: {...}, source, retrievedAt }
+  // NOTE: this verifies the IFSC only — never the account itself.
+  // Throws on 404 when the IFSC isn't in the directory.
+  Future<Map<String, dynamic>> verifyIfsc(String ifsc) async {
+    final res = await _dio.get('/api/v1/verifications/ifsc/$ifsc');
+    return (res.data?['data'] as Map<String, dynamic>?) ?? {};
+  }
 }
