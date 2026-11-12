@@ -19,6 +19,12 @@ dependencies:
   # Local storage
   flutter_secure_storage: ^9.0.0
 
+  # Fingerprint / face app lock (Android)
+  local_auth: ^2.3.0
+  # Pinned to the 1.0.x Android plugin: 1.0.51+ and 2.x need a newer
+  # compileSdk / Kotlin / Gradle than this project uses (34 / 1.9.10 / 8.1).
+  local_auth_android: ">=1.0.46 <1.0.51"
+
   # UI
   google_fonts: ^6.1.0
   shimmer: ^3.0.0

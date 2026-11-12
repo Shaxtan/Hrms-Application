@@ -672,7 +672,7 @@ class _Sidebar extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(vertical: 12),
                 child: Center(
                   child: Text(
-                    'v 1.4',
+                    'v 1.5',
                     style: AppTextStyles.caption.copyWith(
                         color: t.textSec,
                         fontSize: 11,

@@ -5,6 +5,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:dio/dio.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/network/api_client.dart';
+import '../../../../core/security/biometric_service.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AUTH CONTROLLER — real API: POST /api/v1/auth/login
@@ -14,7 +15,7 @@ import '../../../../core/network/api_client.dart';
 //             company: { tenantId, tenantName, logoUrl, ... },
 //             accessibleCompanies: [...] } }
 // ═══════════════════════════════════════════════════════════════════════════════
-class AuthController extends GetxController {
+class AuthController extends GetxController with WidgetsBindingObserver {
   static AuthController get to => Get.find();
   static const _storage = FlutterSecureStorage();
 
@@ -26,6 +27,20 @@ class AuthController extends GetxController {
   final userInitials = ''.obs;
   final companyName = ''.obs;
   final userEmail = ''.obs;
+
+  // ── App lock (fingerprint / face) ─────────────────────────────────────────
+  /// This phone supports the lock (Android only) — shows the Profile switch.
+  final appLockAvailable = false.obs;
+
+  /// The user turned the lock on in Profile.
+  final appLockEnabled = false.obs;
+
+  bool _lockShowing = false;
+  DateTime? _pausedAt;
+
+  /// How long the app may sit in the background before it locks again.
+  /// Short trips (camera / gallery for a document photo) don't re-lock.
+  static const _relockAfter = Duration(seconds: 60);
 
   String get roleDisplay {
     switch (userRole.value) {
@@ -47,7 +62,73 @@ class AuthController extends GetxController {
   @override
   void onInit() {
     super.onInit();
+    WidgetsBinding.instance.addObserver(this); // app background / foreground
     _tryRestoreSession();
+  }
+
+  @override
+  void onClose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.onClose();
+  }
+
+  // ── App lock: background → foreground ─────────────────────────────────────
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) {
+      _pausedAt ??= DateTime.now();
+    } else if (state == AppLifecycleState.resumed) {
+      final away = _pausedAt == null
+          ? Duration.zero
+          : DateTime.now().difference(_pausedAt!);
+      _pausedAt = null;
+      if (isLoggedIn.value &&
+          appLockEnabled.value &&
+          !_lockShowing &&
+          !BiometricService.isAuthenticating &&
+          away >= _relockAfter) {
+        showAppLock();
+      }
+    }
+  }
+
+  /// Reads whether this phone supports the lock and whether it's switched on.
+  Future<void> _loadAppLockState() async {
+    appLockAvailable.value = await BiometricService.isAvailable();
+    appLockEnabled.value =
+        appLockAvailable.value && await BiometricService.isEnabled();
+  }
+
+  /// Covers the app with the lock screen until fingerprint / face succeeds.
+  Future<void> showAppLock() async {
+    if (_lockShowing) return;
+    _lockShowing = true;
+    await Get.to(() => const AppLockPage(),
+        transition: Transition.noTransition,
+        fullscreenDialog: true,
+        popGesture: false);
+    _lockShowing = false;
+  }
+
+  /// Profile switch. Turning it ON asks for fingerprint / face first, so the
+  /// user knows it works on this phone before the app starts locking.
+  Future<void> setAppLock(bool enable) async {
+    if (enable) {
+      final r = await BiometricService.authenticate(
+          reason: 'Confirm to turn on fingerprint / face unlock');
+      if (!r.ok) {
+        if (r.error != null) {
+          Get.snackbar('Could not turn on', r.error!,
+              backgroundColor: AppColors.warning,
+              colorText: Colors.white,
+              snackPosition: SnackPosition.BOTTOM,
+              margin: const EdgeInsets.all(16));
+        }
+        return;
+      }
+    }
+    await BiometricService.setEnabled(enable);
+    appLockEnabled.value = enable;
   }
 
   Future<void> _tryRestoreSession() async {
@@ -77,7 +158,13 @@ class AuthController extends GetxController {
     // Fetch real name if not stored
     if (userName.value.isEmpty || userName.value == 'User') _fetchMyProfile();
 
+    // App lock: read it BEFORE showing the dashboard, so a restored session
+    // goes straight to the lock screen without flashing the dashboard.
+    await _loadAppLockState();
+
     if (Get.currentRoute == '/login') Get.offAllNamed('/home');
+
+    if (appLockEnabled.value) showAppLock();
   }
 
   Future<void> login(String email, String password) async {
@@ -200,6 +287,10 @@ class AuthController extends GetxController {
 
       Get.offAllNamed('/home');
 
+      // Fingerprint / face: just signed in with the password, so no lock now —
+      // only load the state so the Profile switch shows correctly.
+      _loadAppLockState();
+
       // Fetch company name from API if not in login response
       if (companyName.value.isEmpty) _fetchCompanyName();
       // Fetch real user name if login response didn't include it
@@ -224,8 +315,9 @@ class AuthController extends GetxController {
     try {
       await ApiClient.instance.post('/api/v1/auth/logout');
     } catch (_) {}
-    await _storage.deleteAll();
+    await _storage.deleteAll(); // also clears the app-lock setting
     isLoggedIn.value = false;
+    appLockEnabled.value = false;
     userName.value = '';
     userRole.value = '';
     userInitials.value = '';
@@ -975,5 +1067,188 @@ class _Footer extends StatelessWidget {
             fontWeight: FontWeight.w400),
       ),
     ]);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// APP LOCK PAGE — covers the app when a restored / resumed session needs
+// fingerprint / face. The back button can't skip it; success closes it and
+// returns the user to where they were.
+// ═══════════════════════════════════════════════════════════════════════════════
+class AppLockPage extends StatefulWidget {
+  const AppLockPage({super.key});
+
+  @override
+  State<AppLockPage> createState() => _AppLockPageState();
+}
+
+class _AppLockPageState extends State<AppLockPage> {
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    // Open the system fingerprint / face prompt straight away.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _unlock());
+  }
+
+  Future<void> _unlock() async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final r = await BiometricService.authenticate(reason: 'Unlock HRMS');
+    if (!mounted) return;
+    if (r.ok) {
+      Navigator.of(context).pop(); // back to where the user was
+      return;
+    }
+    setState(() {
+      _busy = false;
+      _error = r.error; // null = user cancelled; they can tap to retry
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final auth = Get.find<AuthController>();
+    final name = auth.userName.value;
+
+    return PopScope(
+      canPop: false, // back button can't skip the lock
+      child: AnnotatedRegion<SystemUiOverlayStyle>(
+        value: SystemUiOverlayStyle.light,
+        child: Scaffold(
+          backgroundColor: const Color(0xFF0F172A),
+          body: Stack(children: [
+            _Background(size: MediaQuery.of(context).size),
+            SafeArea(
+              child: Center(
+                child: SingleChildScrollView(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    // Lock tile — same gradient as the login logo
+                    Container(
+                      width: 64,
+                      height: 64,
+                      decoration: BoxDecoration(
+                        gradient: const LinearGradient(
+                          colors: [Color(0xFF4F46E5), Color(0xFF7C3AED)],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        borderRadius: BorderRadius.circular(18),
+                        boxShadow: [
+                          BoxShadow(
+                              color: const Color(0xFF4F46E5).withOpacity(0.5),
+                              blurRadius: 22,
+                              offset: const Offset(0, 8)),
+                        ],
+                      ),
+                      child: const Icon(Icons.lock_rounded,
+                          color: Colors.white, size: 30),
+                    ),
+                    const SizedBox(height: 24),
+                    const Text(
+                      'HRMS is locked',
+                      style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                          letterSpacing: -0.4),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      name.isNotEmpty ? 'Welcome back, $name' : 'Welcome back',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                          fontSize: 14, color: Color(0xFF94A3B8)),
+                    ),
+                    const SizedBox(height: 40),
+
+                    // Fingerprint button — tap to retry
+                    GestureDetector(
+                      onTap: _busy ? null : _unlock,
+                      child: Container(
+                        width: 96,
+                        height: 96,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Colors.white.withOpacity(0.06),
+                          border: Border.all(
+                              color: const Color(0xFF818CF8).withOpacity(0.5),
+                              width: 2),
+                        ),
+                        child: Center(
+                          child: _busy
+                              ? const SizedBox(
+                                  width: 28,
+                                  height: 28,
+                                  child: CircularProgressIndicator(
+                                      strokeWidth: 2.5,
+                                      valueColor: AlwaysStoppedAnimation(
+                                          Color(0xFF818CF8))))
+                              : const Icon(Icons.fingerprint_rounded,
+                                  size: 52, color: Color(0xFF818CF8)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      _busy
+                          ? 'Waiting for fingerprint / face…'
+                          : 'Tap to unlock with fingerprint or face',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                          fontSize: 13, color: Color(0xFFCBD5E1)),
+                    ),
+
+                    if (_error != null) ...[
+                      const SizedBox(height: 16),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 14, vertical: 12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFDC2626).withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                              color: const Color(0xFFDC2626).withOpacity(0.35)),
+                        ),
+                        child: Row(children: [
+                          const Icon(Icons.error_outline_rounded,
+                              color: Color(0xFFFCA5A5), size: 17),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(_error!,
+                                style: const TextStyle(
+                                    fontSize: 13, color: Color(0xFFFCA5A5))),
+                          ),
+                        ]),
+                      ),
+                    ],
+
+                    const SizedBox(height: 40),
+                    // Fallback: sign out and log in with email + password
+                    TextButton(
+                      onPressed: auth.logout,
+                      child: const Text(
+                        'Sign in with password instead',
+                        style: TextStyle(
+                            fontSize: 13,
+                            color: Color(0xFF818CF8),
+                            fontWeight: FontWeight.w500),
+                      ),
+                    ),
+                  ]),
+                ),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
   }
 }

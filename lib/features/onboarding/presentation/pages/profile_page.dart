@@ -59,6 +59,9 @@ class ProfilePage extends StatelessWidget {
                 'Manage push & email alerts', () {}),
             _tile(t, Icons.lock_outline_rounded, 'Change Password',
                 'Update your account password', () {}),
+            // Fingerprint / face app lock — only on Android phones that
+            // support it (hidden on web / Chrome).
+            if (auth.appLockAvailable.value) _appLockTile(t, auth),
             _tile(t, Icons.language_rounded, 'Language', 'English (India)',
                 () {}),
             _tile(
@@ -113,6 +116,50 @@ class ProfilePage extends StatelessWidget {
         ),
       );
     });
+  }
+
+  /// Same look as [_tile], with an on/off switch instead of the chevron.
+  /// Turning it on asks for fingerprint / face first (see setAppLock).
+  Widget _appLockTile(ThemeController t, AuthController auth) {
+    final on = auth.appLockEnabled.value;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
+      decoration: BoxDecoration(
+          color: t.surface,
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          border: Border.all(color: t.border),
+          boxShadow: t.cardShadow),
+      child: Row(children: [
+        Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+                color: AppColors.accent.withOpacity(0.08),
+                borderRadius: BorderRadius.circular(10)),
+            child: const Icon(Icons.fingerprint_rounded,
+                color: AppColors.accent, size: 20)),
+        const SizedBox(width: 12),
+        Expanded(
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+              Text('Fingerprint / Face Unlock',
+                  style: AppTextStyles.bodyMedium.copyWith(
+                      color: t.textPrimary, fontWeight: FontWeight.w500)),
+              Text(
+                  on
+                      ? 'On — asked each time you open the app'
+                      : 'Off — lock the app with your fingerprint or face',
+                  style: AppTextStyles.caption.copyWith(color: t.textSec)),
+            ])),
+        Switch.adaptive(
+          value: on,
+          activeTrackColor: AppColors.accent,
+          onChanged: (v) => auth.setAppLock(v),
+        ),
+      ]),
+    );
   }
 
   Widget _tile(ThemeController t, IconData icon, String title, String subtitle,
