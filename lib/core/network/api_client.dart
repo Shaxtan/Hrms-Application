@@ -11,6 +11,7 @@ import 'package:logger/logger.dart';
 ///   platform (8080) — auth, settings, notification, approval
 ///   core     (8081) — employee, document, tracking, dashboard
 ///   payroll  (8082) — attendance, leave, payroll, compliance, report
+/// test endpoints are 'platform': 8090, 'core': 8091, 'payroll': 8092
 class ApiClient {
   static const _storage = FlutterSecureStorage();
   static final _logger = Logger();
@@ -18,7 +19,7 @@ class ApiClient {
   static const String _apiHost = 'http://103.139.58.189';
   static const String _apiMode = 'port';
 
-  static const _modulePorts = {'platform': 8090, 'core': 8091, 'payroll': 8092};
+  static const _modulePorts = {'platform': 8080, 'core': 8081, 'payroll': 8082};
 
   static const _oldToNew = {
     'AUTH': 'platform',
