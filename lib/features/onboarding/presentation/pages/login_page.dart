@@ -19,15 +19,6 @@ class AuthController extends GetxController with WidgetsBindingObserver {
   static AuthController get to => Get.find();
   static const _storage = FlutterSecureStorage();
 
-  final isLoggedIn = false.obs;
-  final isLoading = false.obs;
-  final errorMessage = ''.obs;
-  final userName = ''.obs;
-  final userRole = ''.obs;
-  final userInitials = ''.obs;
-  final companyName = ''.obs;
-  final userEmail = ''.obs;
-
   // ── App lock (fingerprint / face) ─────────────────────────────────────────
   /// This phone supports the lock (Android only) — shows the Profile switch.
   final appLockAvailable = false.obs;
@@ -41,6 +32,30 @@ class AuthController extends GetxController with WidgetsBindingObserver {
   /// How long the app may sit in the background before it locks again.
   /// Short trips (camera / gallery for a document photo) don't re-lock.
   static const _relockAfter = Duration(seconds: 60);
+
+  final isLoggedIn = false.obs;
+  final isLoading = false.obs;
+  final errorMessage = ''.obs;
+  final userName = ''.obs;
+  final userRole = ''.obs;
+  final userInitials = ''.obs;
+  final companyName = ''.obs;
+  final userEmail = ''.obs;
+
+  // ── Forced password change ────────────────────────────────────────────────
+  // The login response carries employee.mustChangePwd, and the JWT the same
+  // thing as the pwdChangeRequired claim. When either is set the account is on
+  // a temporary password and must not reach the app until it is replaced.
+  final mustChangePwd = false.obs;
+  final isChangingPwd = false.obs;
+  final changePwdError = ''.obs;
+
+  /// The password just used to sign in. Held in memory ONLY — never written to
+  /// secure storage — so the forced-change screen can pre-fill "Current
+  /// password" rather than make the user retype a temporary password they were
+  /// handed moments ago. Cleared on success and on logout.
+  String? _lastUsedPassword;
+  String? get lastUsedPassword => _lastUsedPassword;
 
   String get roleDisplay {
     switch (userRole.value) {
@@ -153,14 +168,32 @@ class AuthController extends GetxController with WidgetsBindingObserver {
       }
     }
 
+    // App lock: read it BEFORE any navigation, so a restored session goes
+    // straight to the lock screen without flashing the page behind it.
+    await _loadAppLockState();
+
+    // A session restored on a temporary password goes straight back to the
+    // change screen — killing and reopening the app must not be a way past it.
+    // Checked against the token's own claim as well as the stored flag, so a
+    // cleared flag can't let a must-change token through.
+    final storedFlag = await _storage.read(key: 'must_change_pwd');
+    final restoredClaims = ApiClient.decodeJwtPayload(token);
+    mustChangePwd.value =
+        storedFlag == '1' || restoredClaims['pwdChangeRequired'] == true;
+
+    if (mustChangePwd.value) {
+      if (Get.currentRoute == '/login') {
+        Get.offAllNamed('/change-password');
+      }
+      // The lock still applies — it guards the session, not the destination.
+      if (appLockEnabled.value) showAppLock();
+      return;
+    }
+
     // Fetch company name if not stored
     if (companyName.value.isEmpty) _fetchCompanyName();
     // Fetch real name if not stored
     if (userName.value.isEmpty || userName.value == 'User') _fetchMyProfile();
-
-    // App lock: read it BEFORE showing the dashboard, so a restored session
-    // goes straight to the lock screen without flashing the dashboard.
-    await _loadAppLockState();
 
     if (Get.currentRoute == '/login') Get.offAllNamed('/home');
 
@@ -277,14 +310,37 @@ class AuthController extends GetxController with WidgetsBindingObserver {
       await _storage.write(key: 'company_name', value: companyStr);
       await _storage.write(key: 'user_email', value: emailStr);
 
+      // Temporary password? The login response says so on the employee object;
+      // the JWT carries the same thing as pwdChangeRequired. Read both, because
+      // a deployment that drops one still sets the other.
+      final forceChange = emp['mustChangePwd'] == true ||
+          data['mustChangePwd'] == true ||
+          jwt['pwdChangeRequired'] == true;
+      await _storage.write(
+          key: 'must_change_pwd', value: forceChange ? '1' : '0');
+
       userName.value = name;
       userRole.value = role;
       userInitials.value = initials;
       companyName.value = companyStr;
       userEmail.value = emailStr;
+      mustChangePwd.value = forceChange;
       isLoggedIn.value = true;
       isLoading.value = false;
 
+      if (forceChange) {
+        // Carry the temporary password forward so the change screen can
+        // pre-fill it, then send the user there instead of the dashboard.
+        // The profile/company fetches below are deliberately skipped until the
+        // password is replaced — nothing in the app is reachable before that.
+        _lastUsedPassword = password;
+        // Load the lock state so the Profile switch is right once they're in.
+        _loadAppLockState();
+        Get.offAllNamed('/change-password');
+        return;
+      }
+
+      _lastUsedPassword = null;
       Get.offAllNamed('/home');
 
       // Fingerprint / face: just signed in with the password, so no lock now —
@@ -311,6 +367,84 @@ class AuthController extends GetxController with WidgetsBindingObserver {
     }
   }
 
+  /// POST /api/v1/auth/password/change
+  ///
+  /// Payload matches the web portal exactly: currentPassword + newPassword +
+  /// confirmPassword. The response carries a fresh access token whose
+  /// pwdChangeRequired claim is gone — swapping it in is what keeps THIS
+  /// device signed in, because the server has just invalidated the old token
+  /// everywhere else.
+  ///
+  /// Returns true on success. The caller handles navigation.
+  Future<bool> changePassword({
+    required String currentPassword,
+    required String newPassword,
+    required String confirmPassword,
+  }) async {
+    changePwdError.value = '';
+    isChangingPwd.value = true;
+
+    try {
+      final res = await ApiClient.instance.post(
+        '/api/v1/auth/password/change',
+        data: {
+          'currentPassword': currentPassword,
+          'newPassword': newPassword,
+          'confirmPassword': confirmPassword,
+        },
+      );
+
+      final body = res.data as Map<String, dynamic>? ?? {};
+      final data = body['data'] is Map<String, dynamic>
+          ? body['data'] as Map<String, dynamic>
+          : <String, dynamic>{};
+
+      final fresh = (data['accessToken'] ?? body['accessToken'])?.toString();
+      if (fresh != null && fresh.isNotEmpty) {
+        await _storage.write(key: 'auth_token', value: fresh);
+        // New token, new session as far as the interceptor is concerned.
+        ApiClient.resetSessionExpiry();
+      }
+
+      await _storage.write(key: 'must_change_pwd', value: '0');
+      mustChangePwd.value = false;
+      _lastUsedPassword = null;
+      isChangingPwd.value = false;
+
+      // These were skipped while the account was locked to the change screen.
+      if (companyName.value.isEmpty) _fetchCompanyName();
+      if (userName.value.isEmpty || userName.value == 'User') _fetchMyProfile();
+      return true;
+    } on DioException catch (e) {
+      final status = e.response?.statusCode;
+      final d = e.response?.data;
+      final serverMsg =
+          (d is Map && d['message'] != null) ? d['message'].toString() : '';
+
+      if (status == 401) {
+        // Unambiguous: the current password did not match.
+        changePwdError.value = 'Current password is incorrect.';
+      } else if (status == 400 || status == 422) {
+        // Could be a wrong current password OR a policy rejection — the
+        // server's own message is the more useful of the two.
+        changePwdError.value =
+            serverMsg.isNotEmpty ? serverMsg : 'Current password is incorrect.';
+      } else if (serverMsg.isNotEmpty) {
+        changePwdError.value = serverMsg;
+      } else if (e.type == DioExceptionType.connectionError) {
+        changePwdError.value = 'Cannot reach server. Check your connection.';
+      } else {
+        changePwdError.value = e.message ?? 'Could not change the password.';
+      }
+      isChangingPwd.value = false;
+      return false;
+    } catch (_) {
+      changePwdError.value = 'An unexpected error occurred.';
+      isChangingPwd.value = false;
+      return false;
+    }
+  }
+
   Future<void> logout() async {
     try {
       await ApiClient.instance.post('/api/v1/auth/logout');
@@ -324,6 +458,9 @@ class AuthController extends GetxController with WidgetsBindingObserver {
     companyName.value = '';
     userEmail.value = '';
     errorMessage.value = '';
+    mustChangePwd.value = false;
+    changePwdError.value = '';
+    _lastUsedPassword = null;
     Get.offAllNamed('/login');
   }
 
@@ -399,18 +536,18 @@ class LoginPage extends StatefulWidget {
 class _LoginPageState extends State<LoginPage>
     with SingleTickerProviderStateMixin {
   final _emailCtrl = TextEditingController();
-  final _passCtrl  = TextEditingController();
-  final _formKey   = GlobalKey<FormState>();
+  final _passCtrl = TextEditingController();
+  final _formKey = GlobalKey<FormState>();
   final _emailFocus = FocusNode();
-  final _passFocus  = FocusNode();
+  final _passFocus = FocusNode();
 
-  bool _obscure      = true;
+  bool _obscure = true;
   bool _emailFocused = false;
-  bool _passFocused  = false;
+  bool _passFocused = false;
 
   late final AnimationController _animCtrl;
-  late final Animation<double>   _fadeAnim;
-  late final Animation<Offset>   _slideAnim;
+  late final Animation<double> _fadeAnim;
+  late final Animation<Offset> _slideAnim;
 
   @override
   void initState() {
@@ -418,15 +555,15 @@ class _LoginPageState extends State<LoginPage>
 
     _animCtrl = AnimationController(
         vsync: this, duration: const Duration(milliseconds: 900));
-    _fadeAnim  = CurvedAnimation(parent: _animCtrl, curve: Curves.easeOut);
-    _slideAnim = Tween<Offset>(
-            begin: const Offset(0, 0.06), end: Offset.zero)
-        .animate(CurvedAnimation(parent: _animCtrl, curve: Curves.easeOutCubic));
+    _fadeAnim = CurvedAnimation(parent: _animCtrl, curve: Curves.easeOut);
+    _slideAnim = Tween<Offset>(begin: const Offset(0, 0.06), end: Offset.zero)
+        .animate(
+            CurvedAnimation(parent: _animCtrl, curve: Curves.easeOutCubic));
 
     _emailFocus.addListener(
         () => setState(() => _emailFocused = _emailFocus.hasFocus));
-    _passFocus.addListener(
-        () => setState(() => _passFocused = _passFocus.hasFocus));
+    _passFocus
+        .addListener(() => setState(() => _passFocused = _passFocus.hasFocus));
 
     WidgetsBinding.instance.addPostFrameCallback((_) => _animCtrl.forward());
   }
@@ -449,7 +586,7 @@ class _LoginPageState extends State<LoginPage>
 
   @override
   Widget build(BuildContext context) {
-    final size   = MediaQuery.of(context).size;
+    final size = MediaQuery.of(context).size;
     final bottom = MediaQuery.of(context).viewInsets.bottom;
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
@@ -468,9 +605,9 @@ class _LoginPageState extends State<LoginPage>
               padding: EdgeInsets.only(bottom: bottom + 24),
               child: ConstrainedBox(
                 constraints: BoxConstraints(
-                  minHeight: size.height
-                      - MediaQuery.of(context).padding.top
-                      - MediaQuery.of(context).padding.bottom,
+                  minHeight: size.height -
+                      MediaQuery.of(context).padding.top -
+                      MediaQuery.of(context).padding.bottom,
                 ),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 24),
@@ -496,14 +633,14 @@ class _LoginPageState extends State<LoginPage>
                         child: SlideTransition(
                           position: _slideAnim,
                           child: _FormCard(
-                            formKey:         _formKey,
-                            emailCtrl:       _emailCtrl,
-                            passCtrl:        _passCtrl,
-                            emailFocus:      _emailFocus,
-                            passFocus:       _passFocus,
-                            emailFocused:    _emailFocused,
-                            passFocused:     _passFocused,
-                            obscure:         _obscure,
+                            formKey: _formKey,
+                            emailCtrl: _emailCtrl,
+                            passCtrl: _passCtrl,
+                            emailFocus: _emailFocus,
+                            passFocus: _passFocus,
+                            emailFocused: _emailFocused,
+                            passFocused: _passFocused,
+                            obscure: _obscure,
                             onToggleObscure: () =>
                                 setState(() => _obscure = !_obscure),
                             onSubmit: _submit,
@@ -550,9 +687,11 @@ class _Background extends StatelessWidget {
       ),
       // Top-right glow
       Positioned(
-        top: -100, right: -100,
+        top: -100,
+        right: -100,
         child: Container(
-          width: 320, height: 320,
+          width: 320,
+          height: 320,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             gradient: RadialGradient(colors: [
@@ -564,9 +703,11 @@ class _Background extends StatelessWidget {
       ),
       // Bottom-left glow
       Positioned(
-        bottom: -80, left: -80,
+        bottom: -80,
+        left: -80,
         child: Container(
-          width: 260, height: 260,
+          width: 260,
+          height: 260,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             gradient: RadialGradient(colors: [
@@ -586,7 +727,7 @@ class _GridPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color       = Colors.white.withOpacity(0.03)
+      ..color = Colors.white.withOpacity(0.03)
       ..strokeWidth = 0.8;
     const step = 40.0;
     for (double x = 0; x < size.width; x += step)
@@ -608,20 +749,24 @@ class _BrandHeader extends StatelessWidget {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       // Logo tile
       Container(
-        width: 52, height: 52,
+        width: 52,
+        height: 52,
         decoration: BoxDecoration(
           gradient: const LinearGradient(
             colors: [Color(0xFF4F46E5), Color(0xFF7C3AED)],
-            begin: Alignment.topLeft, end: Alignment.bottomRight,
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
           ),
           borderRadius: BorderRadius.circular(16),
           boxShadow: [
             BoxShadow(
-              color: const Color(0xFF4F46E5).withOpacity(0.5),
-              blurRadius: 22, offset: const Offset(0, 8)),
+                color: const Color(0xFF4F46E5).withOpacity(0.5),
+                blurRadius: 22,
+                offset: const Offset(0, 8)),
           ],
         ),
-        child: const Icon(Icons.business_rounded, color: Colors.white, size: 26),
+        child:
+            const Icon(Icons.business_rounded, color: Colors.white, size: 26),
       ),
       const SizedBox(height: 20),
       // Wordmark
@@ -631,14 +776,18 @@ class _BrandHeader extends StatelessWidget {
             TextSpan(
               text: 'HR',
               style: TextStyle(
-                  fontSize: 34, fontWeight: FontWeight.w800,
-                  color: Colors.white, letterSpacing: -1.0),
+                  fontSize: 34,
+                  fontWeight: FontWeight.w800,
+                  color: Colors.white,
+                  letterSpacing: -1.0),
             ),
             TextSpan(
               text: 'MS',
               style: TextStyle(
-                  fontSize: 34, fontWeight: FontWeight.w800,
-                  color: Color(0xFF818CF8), letterSpacing: -1.0),
+                  fontSize: 34,
+                  fontWeight: FontWeight.w800,
+                  color: Color(0xFF818CF8),
+                  letterSpacing: -1.0),
             ),
           ],
         ),
@@ -647,8 +796,10 @@ class _BrandHeader extends StatelessWidget {
       const Text(
         'Employee Onboarding Platform',
         style: TextStyle(
-            fontSize: 13, color: Color(0xFF94A3B8),
-            fontWeight: FontWeight.w400, letterSpacing: 0.1),
+            fontSize: 13,
+            color: Color(0xFF94A3B8),
+            fontWeight: FontWeight.w400,
+            letterSpacing: 0.1),
       ),
     ]);
   }
@@ -656,11 +807,11 @@ class _BrandHeader extends StatelessWidget {
 
 // ── Form card ──────────────────────────────────────────────────────────────────
 class _FormCard extends StatelessWidget {
-  final GlobalKey<FormState>  formKey;
+  final GlobalKey<FormState> formKey;
   final TextEditingController emailCtrl;
   final TextEditingController passCtrl;
-  final FocusNode             emailFocus;
-  final FocusNode             passFocus;
+  final FocusNode emailFocus;
+  final FocusNode passFocus;
   final bool emailFocused;
   final bool passFocused;
   final bool obscure;
@@ -681,9 +832,9 @@ class _FormCard extends StatelessWidget {
   });
 
   InputDecoration _fieldDeco({
-    required String   hint,
+    required String hint,
     required IconData icon,
-    required bool     focused,
+    required bool focused,
     Widget? suffix,
   }) {
     return InputDecoration(
@@ -691,12 +842,13 @@ class _FormCard extends StatelessWidget {
       hintStyle: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 14),
       prefixIcon: Padding(
         padding: const EdgeInsets.all(13),
-        child: Icon(icon, size: 18,
+        child: Icon(icon,
+            size: 18,
             color: focused ? const Color(0xFF4F46E5) : const Color(0xFF94A3B8)),
       ),
       prefixIconConstraints: const BoxConstraints(minWidth: 46),
       suffixIcon: suffix,
-      filled:    true,
+      filled: true,
       fillColor: focused ? const Color(0xFFEEF2FF) : const Color(0xFFF8FAFC),
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
       border: OutlineInputBorder(
@@ -730,8 +882,9 @@ class _FormCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(24),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.25),
-            blurRadius: 40, offset: const Offset(0, 20)),
+              color: Colors.black.withOpacity(0.25),
+              blurRadius: 40,
+              offset: const Offset(0, 20)),
         ],
       ),
       child: ClipRRect(
@@ -757,8 +910,10 @@ class _FormCard extends StatelessWidget {
                   const Text(
                     'Welcome back',
                     style: TextStyle(
-                        fontSize: 22, fontWeight: FontWeight.w700,
-                        color: Color(0xFF0F172A), letterSpacing: -0.4),
+                        fontSize: 22,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF0F172A),
+                        letterSpacing: -0.4),
                   ),
                   const SizedBox(height: 4),
                   const Text(
@@ -772,16 +927,16 @@ class _FormCard extends StatelessWidget {
                   const _FieldLabel(label: 'Email or Phone'),
                   const SizedBox(height: 6),
                   TextFormField(
-                    controller:      emailCtrl,
-                    focusNode:       emailFocus,
-                    keyboardType:    TextInputType.text,
+                    controller: emailCtrl,
+                    focusNode: emailFocus,
+                    keyboardType: TextInputType.text,
                     textInputAction: TextInputAction.next,
                     onFieldSubmitted: (_) => passFocus.requestFocus(),
-                    style: const TextStyle(
-                        fontSize: 15, color: Color(0xFF0F172A)),
+                    style:
+                        const TextStyle(fontSize: 15, color: Color(0xFF0F172A)),
                     decoration: _fieldDeco(
-                      hint:    'Email or phone number',
-                      icon:    Icons.person_outline_rounded,
+                      hint: 'Email or phone number',
+                      icon: Icons.person_outline_rounded,
                       focused: emailFocused,
                     ),
                     validator: (v) {
@@ -797,26 +952,27 @@ class _FormCard extends StatelessWidget {
                   const _FieldLabel(label: 'Password'),
                   const SizedBox(height: 6),
                   TextFormField(
-                    controller:      passCtrl,
-                    focusNode:       passFocus,
-                    obscureText:     obscure,
+                    controller: passCtrl,
+                    focusNode: passFocus,
+                    obscureText: obscure,
                     textInputAction: TextInputAction.done,
                     onFieldSubmitted: (_) => onSubmit(),
-                    style: const TextStyle(
-                        fontSize: 15, color: Color(0xFF0F172A)),
+                    style:
+                        const TextStyle(fontSize: 15, color: Color(0xFF0F172A)),
                     decoration: _fieldDeco(
-                      hint:    '••••••••',
-                      icon:    Icons.lock_outline_rounded,
+                      hint: '••••••••',
+                      icon: Icons.lock_outline_rounded,
                       focused: passFocused,
                       suffix: GestureDetector(
                         onTap: onToggleObscure,
                         child: Padding(
                           padding: const EdgeInsets.all(12),
                           child: Icon(
-                            obscure
-                                ? Icons.visibility_off_outlined
-                                : Icons.visibility_outlined,
-                            size: 18, color: const Color(0xFF94A3B8)),
+                              obscure
+                                  ? Icons.visibility_off_outlined
+                                  : Icons.visibility_outlined,
+                              size: 18,
+                              color: const Color(0xFF94A3B8)),
                         ),
                       ),
                     ),
@@ -839,7 +995,8 @@ class _FormCard extends StatelessWidget {
                         child: Text(
                           'Forgot password?',
                           style: TextStyle(
-                              fontSize: 13, color: Color(0xFF4F46E5),
+                              fontSize: 13,
+                              color: Color(0xFF4F46E5),
                               fontWeight: FontWeight.w500),
                         ),
                       ),
@@ -861,8 +1018,7 @@ class _FormCard extends StatelessWidget {
                           color: const Color(0xFFFEF2F2),
                           borderRadius: BorderRadius.circular(12),
                           border: Border.all(
-                              color:
-                                  const Color(0xFFDC2626).withOpacity(0.25)),
+                              color: const Color(0xFFDC2626).withOpacity(0.25)),
                         ),
                         child: Row(children: [
                           const Icon(Icons.error_outline_rounded,
@@ -888,7 +1044,7 @@ class _FormCard extends StatelessWidget {
                         onTap: loading ? null : onSubmit,
                         child: AnimatedContainer(
                           duration: const Duration(milliseconds: 180),
-                          width:  double.infinity,
+                          width: double.infinity,
                           height: 52,
                           decoration: BoxDecoration(
                             gradient: loading
@@ -899,7 +1055,7 @@ class _FormCard extends StatelessWidget {
                                       Color(0xFF7C3AED)
                                     ],
                                     begin: Alignment.topLeft,
-                                    end:   Alignment.bottomRight,
+                                    end: Alignment.bottomRight,
                                   ),
                             color: loading ? const Color(0xFFE2E8F0) : null,
                             borderRadius: BorderRadius.circular(14),
@@ -907,23 +1063,23 @@ class _FormCard extends StatelessWidget {
                                 ? []
                                 : [
                                     BoxShadow(
-                                      color: const Color(0xFF4F46E5)
-                                          .withOpacity(0.38),
-                                      blurRadius: 18,
-                                      offset: const Offset(0, 6)),
+                                        color: const Color(0xFF4F46E5)
+                                            .withOpacity(0.38),
+                                        blurRadius: 18,
+                                        offset: const Offset(0, 6)),
                                   ],
                           ),
                           child: Center(
                             child: loading
                                 ? const SizedBox(
-                                    width: 22, height: 22,
+                                    width: 22,
+                                    height: 22,
                                     child: CircularProgressIndicator(
                                         strokeWidth: 2.5,
                                         valueColor: AlwaysStoppedAnimation(
                                             Color(0xFF64748B))))
                                 : const Row(
-                                    mainAxisAlignment:
-                                        MainAxisAlignment.center,
+                                    mainAxisAlignment: MainAxisAlignment.center,
                                     children: [
                                       Text(
                                         'Sign in',
@@ -953,8 +1109,8 @@ class _FormCard extends StatelessWidget {
                       padding: EdgeInsets.symmetric(horizontal: 12),
                       child: Text(
                         'or continue with',
-                        style: TextStyle(
-                            fontSize: 12, color: Color(0xFF94A3B8)),
+                        style:
+                            TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
                       ),
                     ),
                     Expanded(child: Divider(color: Color(0xFFE2E8F0))),
@@ -964,7 +1120,7 @@ class _FormCard extends StatelessWidget {
 
                   // SSO button (placeholder)
                   _SsoButton(
-                    icon:  Icons.account_circle_outlined,
+                    icon: Icons.account_circle_outlined,
                     label: 'Single Sign-On (SSO)',
                     onTap: () {},
                   ),
@@ -988,16 +1144,15 @@ class _FieldLabel extends StatelessWidget {
     return Text(
       label,
       style: const TextStyle(
-          fontSize: 13, fontWeight: FontWeight.w500,
-          color: Color(0xFF475569)),
+          fontSize: 13, fontWeight: FontWeight.w500, color: Color(0xFF475569)),
     );
   }
 }
 
 // ── SSO button ─────────────────────────────────────────────────────────────────
 class _SsoButton extends StatelessWidget {
-  final IconData     icon;
-  final String       label;
+  final IconData icon;
+  final String label;
   final VoidCallback onTap;
   const _SsoButton(
       {required this.icon, required this.label, required this.onTap});
@@ -1020,7 +1175,8 @@ class _SsoButton extends StatelessWidget {
           Text(
             label,
             style: const TextStyle(
-                fontSize: 14, fontWeight: FontWeight.w500,
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
                 color: Color(0xFF475569)),
           ),
         ]),
@@ -1038,7 +1194,7 @@ class _Footer extends StatelessWidget {
     return Column(children: [
       // Security badges
       Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-        _badge(Icons.lock_rounded,     'End-to-end encrypted'),
+        _badge(Icons.lock_rounded, 'End-to-end encrypted'),
         const SizedBox(width: 20),
         _badge(Icons.verified_rounded, 'SOC 2 compliant'),
       ]),
@@ -1063,7 +1219,8 @@ class _Footer extends StatelessWidget {
       Text(
         label,
         style: const TextStyle(
-            fontSize: 11, color: Color(0xFF94A3B8),
+            fontSize: 11,
+            color: Color(0xFF94A3B8),
             fontWeight: FontWeight.w400),
       ),
     ]);

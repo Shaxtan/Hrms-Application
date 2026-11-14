@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'core/theme/app_theme.dart';
 import 'core/network/api_client.dart';
+import 'features/onboarding/presentation/pages/change_password_page.dart';
 import 'features/onboarding/presentation/pages/dashboard_page.dart';
 import 'features/onboarding/presentation/pages/login_page.dart';
 
@@ -42,13 +43,17 @@ class HrmsApp extends StatelessWidget {
       return GetMaterialApp(
         title: 'HRMS',
         debugShowCheckedModeBanner: false,
-        theme:     buildLightTheme(),
+        theme: buildLightTheme(),
         darkTheme: buildDarkTheme(),
         themeMode: t.isDark ? ThemeMode.dark : ThemeMode.light,
         initialRoute: '/login',
         getPages: [
           GetPage(name: '/login', page: () => const LoginPage()),
-          GetPage(name: '/home',  page: () => const MainShell()),
+          GetPage(name: '/home', page: () => const MainShell()),
+          // Reached when the login response says mustChangePwd. The page
+          // itself blocks back navigation while the flag is set.
+          GetPage(
+              name: '/change-password', page: () => const ChangePasswordPage()),
         ],
         defaultTransition: Transition.cupertino,
         transitionDuration: const Duration(milliseconds: 280),
