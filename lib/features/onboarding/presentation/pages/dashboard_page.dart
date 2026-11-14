@@ -21,7 +21,7 @@ import 'profile_page.dart';
 // ═══════════════════════════════════════════════════════════════════════════════
 // ATTENDANCE CONTROLLER — real API: punch-in/out + today status
 // ═══════════════════════════════════════════════════════════════════════════════
-class AttendanceController extends GetxController {
+class AttendanceController extends GetxController with WidgetsBindingObserver {
   // Three-state model mirroring the web portal's CheckInOutPage:
   //   NOT_CHECKED_IN -> CHECKED_IN -> CHECKED_OUT
   // `isCheckedIn` is kept in sync so existing widgets keep working.
@@ -40,6 +40,9 @@ class AttendanceController extends GetxController {
   final employeeId = Rxn<int>();
   Timer? _clockTimer;
   Timer? _elapsedTimer;
+  // Periodic reconcile with the server while checked in, so a punch that the
+  // backend holds is never contradicted by stale in-memory state.
+  Timer? _resyncTimer;
 
   // Punch source. 'WEB' is the only value proven against this backend — it is
   // exactly what the working web portal sends. Change to 'MOBILE' only if the
@@ -54,17 +57,39 @@ class AttendanceController extends GetxController {
   @override
   void onInit() {
     super.onInit();
+    // Needed for didChangeAppLifecycleState below — the punch state has to be
+    // re-read whenever the app comes back to the foreground.
+    WidgetsBinding.instance.addObserver(this);
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       currentTime.value = DateTime.now();
+    });
+    // While a punch is open, reconcile with the server every few minutes. This
+    // is what brings the card back after a token refresh / re-login: the
+    // backend still holds the punch, only the app had lost sight of it.
+    _resyncTimer = Timer.periodic(const Duration(minutes: 5), (_) {
+      if (attendanceStatus.value == statusIn) fetchTodayStatus();
     });
     fetchTodayStatus();
   }
 
   @override
   void onClose() {
+    WidgetsBinding.instance.removeObserver(this);
     _clockTimer?.cancel();
     _elapsedTimer?.cancel();
+    _resyncTimer?.cancel();
     super.onClose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state != AppLifecycleState.resumed) return;
+    // Android freezes Timer.periodic while the app is backgrounded, so the
+    // elapsed figure is stale the moment we come back. Re-anchor it on the
+    // punch-in timestamp immediately, then reconcile with the server.
+    _resyncElapsed();
+    fetchTodayStatus();
   }
 
   // ── Employee id resolution ────────────────────────────────────────────────
@@ -121,6 +146,12 @@ class AttendanceController extends GetxController {
     isLoadingStatus.value = true;
     final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
     Map<String, dynamic>? record;
+    // Whether the server actually answered. "No punch today" and "I could not
+    // reach the server" are NOT the same thing, and conflating them is what
+    // made a live check-in disappear: when the 15-minute token expired both
+    // reads below threw 401, record stayed null, and _applyRecord(null) reset
+    // the card to NOT_CHECKED_IN even though the backend still held the punch.
+    var serverAnswered = false;
 
     try {
       final res = await _dio.post('/api/v1/attendance/list', data: {
@@ -130,6 +161,7 @@ class AttendanceController extends GetxController {
         'sortDir': 'DESC',
         'filters': {'dateFrom': today, 'dateTo': today},
       });
+      serverAnswered = true;
       final list = res.data?['data'] as List?;
       if (list != null && list.isNotEmpty) {
         record = Map<String, dynamic>.from(list.first as Map);
@@ -146,6 +178,7 @@ class AttendanceController extends GetxController {
                 'from': today,
                 'to': today
               });
+          serverAnswered = true;
           final list = res.data?['data'] as List?;
           if (list != null && list.isNotEmpty) {
             final entry = Map<String, dynamic>.from(list.first as Map);
@@ -157,7 +190,14 @@ class AttendanceController extends GetxController {
       }
     }
 
-    _applyRecord(record);
+    if (record != null || serverAnswered) {
+      _applyRecord(record);
+    } else {
+      // Offline / mid-refresh: hold the punch state we already have and just
+      // re-anchor the duration, so the screen keeps counting instead of
+      // silently dropping the day's attendance.
+      _resyncElapsed();
+    }
     isLoadingStatus.value = false;
   }
 
@@ -183,20 +223,69 @@ class AttendanceController extends GetxController {
     if (pin == null) {
       attendanceStatus.value = statusNotIn;
       isCheckedIn.value = false;
-      elapsedSecs.value = 0;
     } else if (pout == null) {
       attendanceStatus.value = statusIn;
       isCheckedIn.value = true;
-      elapsedSecs.value =
-          DateTime.now().difference(pin).inSeconds.clamp(0, 86400).toInt();
-      _elapsedTimer = Timer.periodic(
-          const Duration(seconds: 1), (_) => elapsedSecs.value++);
+      // Tick by RECOMPUTING from punch-in, never by incrementing. This is the
+      // same thing the web portal does (Date.now() - punchInDate every tick),
+      // and it is why the portal's figure stays exact while this one drifted.
+      _elapsedTimer =
+          Timer.periodic(const Duration(seconds: 1), (_) => _resyncElapsed());
     } else {
       attendanceStatus.value = statusOut;
       isCheckedIn.value = false;
-      elapsedSecs.value =
-          pout.difference(pin).inSeconds.clamp(0, 86400).toInt();
     }
+    _resyncElapsed();
+  }
+
+  /// Derive the worked duration from the recorded timestamps.
+  ///
+  /// The old code seeded `elapsedSecs` once and then did `elapsedSecs.value++`
+  /// on a one-second timer. Timer.periodic is throttled — and on Android
+  /// suspended outright — while the app is backgrounded or the screen is off,
+  /// so every second the phone spent asleep was lost and the displayed
+  /// duration ran progressively short of the real one. Anchoring on punch-in
+  /// makes it self-correcting: a missed tick costs nothing, because the next
+  /// tick recomputes the true difference.
+  void _resyncElapsed() {
+    final pin = checkInTime.value;
+    if (pin == null) {
+      elapsedSecs.value = 0;
+      return;
+    }
+    // Open punch counts up to now; a closed one is frozen at punch-out.
+    final end = checkOutTime.value ?? DateTime.now();
+    elapsedSecs.value = end.difference(pin).inSeconds.clamp(0, 86400).toInt();
+  }
+
+  /// Seed state straight from the punch response.
+  ///
+  /// punch-in / punch-out return the record the backend just wrote, with its
+  /// own authoritative timestamp. Applying it before re-reading means a
+  /// follow-up read that fails (expired token, no network) can no longer leave
+  /// the screen on "Not Checked In" for a punch the server has already stored.
+  void _applyPunchResponse(dynamic body, {required bool isOut}) {
+    final data = body is Map ? body['data'] : null;
+    final map = data is Map
+        ? Map<String, dynamic>.from(data)
+        : const <String, dynamic>{};
+
+    // Local ISO (no trailing Z) parses back as local, so _applyRecord's
+    // toLocal() is a no-op on these fallbacks and a real conversion on the
+    // server's UTC values.
+    final nowIso = DateTime.now().toIso8601String();
+    final inRaw = map['punchInTime'] ??
+        map['punchInTimeIST'] ??
+        checkInTime.value?.toIso8601String() ??
+        nowIso;
+    final outRaw = map['punchOutTime'] ??
+        map['punchOutTimeIST'] ??
+        (isOut ? nowIso : null);
+
+    _applyRecord(<String, dynamic>{
+      'punchInTime': inRaw,
+      'punchOutTime': outRaw,
+    });
   }
 
   Map<String, dynamic> _punchPayload(int? empId) => {
@@ -214,9 +303,11 @@ class AttendanceController extends GetxController {
       final empId = await _resolveEmployeeId();
       // The old code posted an empty body — no employeeId, no punchTime — so
       // the backend had nothing to record. This is the real fix.
-      await _dio.post('/api/v1/attendance/punch-in',
+      final res = await _dio.post('/api/v1/attendance/punch-in',
           data: _punchPayload(empId));
-      // Re-read from the server so the displayed times are authoritative.
+      // Record the punch locally from the response first, then re-read from
+      // the server so the displayed times are authoritative.
+      _applyPunchResponse(res.data, isOut: false);
       await fetchTodayStatus();
       Get.snackbar('Checked In', 'Attendance recorded at $checkInDisplay.',
           backgroundColor: AppColors.success,
@@ -239,8 +330,9 @@ class AttendanceController extends GetxController {
     isPunching.value = true;
     try {
       final empId = await _resolveEmployeeId();
-      await _dio.post('/api/v1/attendance/punch-out',
+      final res = await _dio.post('/api/v1/attendance/punch-out',
           data: _punchPayload(empId));
+      _applyPunchResponse(res.data, isOut: true);
       await fetchTodayStatus();
       Get.snackbar('Checked Out', 'Attendance recorded at $checkOutDisplay.',
           backgroundColor: AppColors.info,
@@ -276,6 +368,27 @@ class AttendanceController extends GetxController {
 
   String get checkInDisplay => _fmt(checkInTime.value);
   String get checkOutDisplay => _fmt(checkOutTime.value);
+
+  /// Same clock, to the second — for the Check In / Check Out tiles, where the
+  /// exact recorded punch time matters. The compact `_fmt` above stays in use
+  /// for the four-across summary row, which has no room for seconds.
+  String _fmtPrecise(DateTime? dt) {
+    if (dt == null) return '--:--:--';
+    final h12 =
+        (dt.hour % 12 == 0 ? 12 : dt.hour % 12).toString().padLeft(2, '0');
+    final min = dt.minute.toString().padLeft(2, '0');
+    final sec = dt.second.toString().padLeft(2, '0');
+    final ampm = dt.hour >= 12 ? 'PM' : 'AM';
+    return '$h12:$min:$sec $ampm';
+  }
+
+  String get checkInPrecise => _fmtPrecise(checkInTime.value);
+  String get checkOutPrecise => _fmtPrecise(checkOutTime.value);
+
+  /// Label for the duration chip: live while checked in, final once out.
+  String get durationLabel => hasCheckedOut
+      ? 'Worked: $elapsedFormatted'
+      : 'Working: $elapsedFormatted';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -672,7 +785,7 @@ class _Sidebar extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(vertical: 12),
                 child: Center(
                   child: Text(
-                    'v 1.5',
+                    'v 1.1',
                     style: AppTextStyles.caption.copyWith(
                         color: t.textSec,
                         fontSize: 11,
@@ -1611,8 +1724,8 @@ class _PipelineStat extends StatelessWidget {
                 color: color, fontSize: 20, fontWeight: FontWeight.w700)),
         const SizedBox(height: 2),
         Text(label,
-            style: AppTextStyles.caption
-                .copyWith(color: t.textSec, fontSize: 10)),
+            style:
+                AppTextStyles.caption.copyWith(color: t.textSec, fontSize: 10)),
       ]),
     );
   }
@@ -2037,7 +2150,8 @@ class _CheckInOutTab extends StatelessWidget {
                 Expanded(
                     child: _TimeTile(
                         label: 'Check In',
-                        time: ctrl.checkInDisplay,
+                        // To the second — this is the recorded punch time.
+                        time: ctrl.checkInPrecise,
                         icon: Icons.login_rounded,
                         color: AppColors.success,
                         active: ctrl.checkInTime.value != null,
@@ -2046,7 +2160,7 @@ class _CheckInOutTab extends StatelessWidget {
                 Expanded(
                     child: _TimeTile(
                         label: 'Check Out',
-                        time: ctrl.checkOutDisplay,
+                        time: ctrl.checkOutPrecise,
                         icon: Icons.logout_rounded,
                         color: AppColors.danger,
                         active: ctrl.checkOutTime.value != null,
@@ -2283,14 +2397,16 @@ class _ClockCard extends StatelessWidget {
           Text('${days[now.weekday - 1]}, ${now.day} ${months[now.month - 1]}',
               style: TextStyle(
                   color: Colors.white.withOpacity(0.6), fontSize: 13)),
-          if (chk) ...[
+          // Shown while checked in AND after checking out, so the day's total
+          // stays on screen instead of vanishing with the punch-out.
+          if (chk || done) ...[
             const SizedBox(height: 16),
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               decoration: BoxDecoration(
                   color: Colors.white.withOpacity(0.12),
                   borderRadius: BorderRadius.circular(12)),
-              child: Text('Working: ${ctrl.elapsedFormatted}',
+              child: Text(ctrl.durationLabel,
                   style: const TextStyle(
                       color: Colors.white,
                       fontSize: 16,
@@ -2416,9 +2532,16 @@ class _TimeTile extends StatelessWidget {
                   .copyWith(color: active ? color : t.textTert)),
         ]),
         const SizedBox(height: 8),
-        Text(time,
-            style: AppTextStyles.numericMedium
-                .copyWith(color: active ? color : t.textTert, fontSize: 18)),
+        // "09:07:32 AM" is wider than the old "09:07 AM"; scaleDown keeps it
+        // on one line on narrow phones instead of overflowing the tile.
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: Text(time,
+              maxLines: 1,
+              style: AppTextStyles.numericMedium
+                  .copyWith(color: active ? color : t.textTert, fontSize: 18)),
+        ),
       ]),
     );
   }
@@ -2673,12 +2796,15 @@ class _MyAttendanceTab extends StatelessWidget {
                         children: [
                           _SummaryStat(
                               label: 'Working Hrs',
-                              value: busy ? '—' : ctrl.summaryText('workingHours'),
+                              value:
+                                  busy ? '—' : ctrl.summaryText('workingHours'),
                               color: t.textPrimary,
                               t: t),
                           _SummaryStat(
                               label: 'OT Hours',
-                              value: busy ? '—' : ctrl.summaryText('overtimeHours'),
+                              value: busy
+                                  ? '—'
+                                  : ctrl.summaryText('overtimeHours'),
                               color: t.textPrimary,
                               t: t),
                           _SummaryStat(
