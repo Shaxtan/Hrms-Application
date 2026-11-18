@@ -1816,6 +1816,9 @@ class _PersonalInfoSection extends StatelessWidget {
       initialDate: DateTime.now().subtract(const Duration(days: 365 * 22)),
       firstDate: DateTime(1950),
       lastDate: DateTime.now().subtract(const Duration(days: 365 * 18)),
+      // Open on the year list (scrolled to ~22 years back) so the user picks a
+      // year in one tap instead of scrolling the day calendar decades back.
+      initialDatePickerMode: DatePickerMode.year,
       builder: (ctx, child) => Theme(
         data: ThemeData(
             colorScheme: const ColorScheme.light(primary: AppColors.accent)),
@@ -2839,13 +2842,56 @@ class _FamilyMembersSection extends StatelessWidget {
     const femaleRels = {'MOTHER', 'DAUGHTER', 'SISTER'};
 
     // Native date picker for DOB — writes DD-MM-YYYY into the controller.
+    // The calendar opens relative to the EMPLOYEE's own date of birth and the
+    // chosen relationship: a parent opens on an older year (and can't be born
+    // after the employee), a child on a younger one. Opens in year mode so the
+    // user taps a year instead of scrolling decades.
     Future<void> pickDob() async {
       final now = DateTime.now();
+
+      // Parse the employee's DOB (stored as DD-MM-YYYY) into a DateTime.
+      DateTime? empDob;
+      final t = ctrl.dobController.text.trim();
+      if (t.length == 10) {
+        final p = t.split('-');
+        if (p.length == 3) {
+          empDob = DateTime.tryParse('${p[2]}-${p[1]}-${p[0]}');
+        }
+      }
+
+      const parents = {'FATHER', 'MOTHER'};
+      const children = {'SON', 'DAUGHTER'};
+      final rel = relationship.value;
+
+      DateTime first = DateTime(1920);
+      DateTime last = now;
+      DateTime initial;
+
+      if (empDob != null && parents.contains(rel)) {
+        // A parent is older than the employee.
+        last = empDob;
+        initial = DateTime(empDob.year - 28, empDob.month, empDob.day);
+      } else if (empDob != null && children.contains(rel)) {
+        // A child is younger than the employee.
+        first = empDob;
+        initial = DateTime(empDob.year + 22, empDob.month, empDob.day);
+      } else if (empDob != null) {
+        // Spouse / sibling / other — around the employee's own age.
+        initial = empDob;
+      } else {
+        // Employee DOB not filled yet — sensible adult default.
+        initial = DateTime(now.year - 30);
+      }
+      // Keep the opening date within the allowed range.
+      if (initial.isBefore(first)) initial = first;
+      if (initial.isAfter(last)) initial = last;
+
       final picked = await showDatePicker(
         context: context,
-        initialDate: DateTime(now.year - 25),
-        firstDate: DateTime(1920),
-        lastDate: now,
+        initialDate: initial,
+        firstDate: first,
+        lastDate: last,
+        initialDatePickerMode: DatePickerMode.year,
         builder: (ctx, child) => Theme(
           data: ThemeData(
               colorScheme: const ColorScheme.light(primary: AppColors.accent)),
