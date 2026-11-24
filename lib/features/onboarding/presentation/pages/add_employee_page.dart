@@ -233,6 +233,12 @@ class AddEmployeeController extends GetxController {
     _forceUpper(panController, maxLength: 10, alphaNumOnly: true);
     _digitsOnly(uanController, maxLength: 12); // UAN = 12 digits
     _digitsOnly(esicController, maxLength: 10); // ESIC = 10 digits
+    // Mobile numbers: 10 digits. These two already pass inputFormatters to
+    // AppTextField, but — exactly as the UAN/ESIC comment above says — that
+    // only bites if AppTextField forwards them. Enforcing on the controller
+    // makes the cap hold either way.
+    _digitsOnly(phoneController, maxLength: 10);
+    _digitsOnly(secondaryPhoneController, maxLength: 10);
 
     // ── DD-MM-YYYY mask on every date field (typed input) ──────────────
     _dateMask(dobController);
@@ -667,11 +673,33 @@ class AddEmployeeController extends GetxController {
       aadhaarCheckState.value == 'ACTIVE_DUPLICATE' ||
       aadhaarCheckState.value == 'PENDING_DUPLICATE';
 
+  /// Fixed-length fields that were started but never finished.
+  ///
+  /// The missing-field check only covers what the employment type makes
+  /// MANDATORY, so without this an optional second mobile, UAN or ESIC could
+  /// still reach the backend half-typed. Each is only judged once something
+  /// has been entered — leaving an optional field blank stays fine.
+  List<String> get incompleteNumbers {
+    final out = <String>[];
+    void check(String label, String value, int len) {
+      final v = value.trim();
+      if (v.isNotEmpty && v.length != len)
+        out.add('$label must be $len digits');
+    }
+
+    check('Phone Number', phoneController.text, 10);
+    check('Second Mobile', secondaryPhoneController.text, 10);
+    check('UAN', uanController.text, 12);
+    check('ESIC Number', esicController.text, 10);
+    return out;
+  }
+
   bool get canSubmit =>
       missingFields.isEmpty &&
       missingDocs.isEmpty &&
       !aadhaarConsentMissing &&
       !aadhaarBlocking &&
+      incompleteNumbers.isEmpty &&
       emailCheckState.value != 'TAKEN' &&
       phoneCheckState.value != 'TAKEN' &&
       !submitting.value;
@@ -686,8 +714,15 @@ class AddEmployeeController extends GetxController {
       'fatherHusbandName': fatherHusbandNameController.text,
       'motherName': motherNameController.text,
       'email': emailController.text,
-      'phone': phoneController.text,
-      'secondaryPhone': secondaryPhoneController.text,
+      // A mobile number only counts once all 10 digits are in — same idea as
+      // the date fields below. Without this a half-typed number cleared the
+      // "missing" flag and the form could be submitted with 4 digits.
+      'phone': phoneController.text.trim().length == 10
+          ? phoneController.text.trim()
+          : '',
+      'secondaryPhone': secondaryPhoneController.text.trim().length == 10
+          ? secondaryPhoneController.text.trim()
+          : '',
       // A date only counts once fully typed as DD-MM-YYYY (10 chars).
       'dateOfBirth': dobController.text.length == 10 ? dobController.text : '',
       'gender': genderValue.value,
@@ -1280,7 +1315,12 @@ class _MissingPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Obx(() => MissingFieldsPanel(
-          fields: ctrl.missingFields.map(labelForField).toList(),
+          // Half-typed fixed-length numbers are listed alongside the missing
+          // ones, so a disabled Create button always says why.
+          fields: [
+            ...ctrl.missingFields.map(labelForField),
+            ...ctrl.incompleteNumbers,
+          ],
           docs: ctrl.missingDocs.map(labelForDoc).toList(),
           consentMissing: ctrl.aadhaarConsentMissing,
           employmentTypeLabel: EmploymentType.values
@@ -2389,6 +2429,8 @@ class _BankTaxSection extends StatelessWidget {
             FilteringTextInputFormatter.digitsOnly,
             LengthLimitingTextInputFormatter(12),
           ],
+          // Needed for the 12-digit completeness check to re-evaluate.
+          onChanged: (_) => ctrl.recomputeMissing(),
           helperText: 'Optional — 12 digits'),
       const SizedBox(height: 12),
       AppTextField(
@@ -2408,6 +2450,8 @@ class _BankTaxSection extends StatelessWidget {
             FilteringTextInputFormatter.digitsOnly,
             LengthLimitingTextInputFormatter(10),
           ],
+          // Needed for the 10-digit completeness check to re-evaluate.
+          onChanged: (_) => ctrl.recomputeMissing(),
           helperText: 'Optional — 10 digits'),
     ]);
   }
@@ -3240,8 +3284,18 @@ class _EmergencyContactsSection extends StatelessWidget {
           TextField(
               controller: phoneCtrl,
               decoration: const InputDecoration(
-                  labelText: 'Phone *', border: OutlineInputBorder()),
-              keyboardType: TextInputType.phone),
+                  labelText: 'Phone *',
+                  hintText: '9876543210',
+                  counterText: '',
+                  border: OutlineInputBorder()),
+              keyboardType: TextInputType.phone,
+              maxLength: 10,
+              // Was the only phone field in the page with no restriction at
+              // all — letters and any length went straight to the backend.
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(10),
+              ]),
           const SizedBox(height: 12),
           TextField(
               controller: emailCtrl,
@@ -3271,6 +3325,15 @@ class _EmergencyContactsSection extends StatelessWidget {
                     phoneCtrl.text.trim().isEmpty) {
                   Get.snackbar(
                       'Missing', 'Name, relationship and phone are required',
+                      backgroundColor: AppColors.warning,
+                      colorText: Colors.white,
+                      snackPosition: SnackPosition.BOTTOM,
+                      margin: const EdgeInsets.all(16));
+                  return;
+                }
+                // Same 10-digit rule the family-member dialog enforces.
+                if (phoneCtrl.text.trim().length != 10) {
+                  Get.snackbar('Invalid', 'Phone must be 10 digits',
                       backgroundColor: AppColors.warning,
                       colorText: Colors.white,
                       snackPosition: SnackPosition.BOTTOM,

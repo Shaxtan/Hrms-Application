@@ -931,6 +931,9 @@ class _FormCard extends StatelessWidget {
                     focusNode: emailFocus,
                     keyboardType: TextInputType.text,
                     textInputAction: TextInputAction.next,
+                    // Hard stop at 10 while the input is a pure number; lifts
+                    // as soon as it is clearly an email.
+                    inputFormatters: [_MobileOrEmailLimiter()],
                     onFieldSubmitted: (_) => passFocus.requestFocus(),
                     style:
                         const TextStyle(fontSize: 15, color: Color(0xFF0F172A)),
@@ -940,8 +943,14 @@ class _FormCard extends StatelessWidget {
                       focused: emailFocused,
                     ),
                     validator: (v) {
-                      if (v == null || v.trim().isEmpty)
-                        return 'Email / phone is required';
+                      final s = (v ?? '').trim();
+                      if (s.isEmpty) return 'Email / phone is required';
+                      // This field takes an email OR a mobile number, so the
+                      // 10-digit rule only applies when what was typed is
+                      // plainly a number — an email is left alone.
+                      if (RegExp(r'^[0-9]+$').hasMatch(s) && s.length != 10) {
+                        return 'Mobile number must be exactly 10 digits';
+                      }
                       return null;
                     },
                   ),
@@ -1130,6 +1139,40 @@ class _FormCard extends StatelessWidget {
           ),
         ]),
       ),
+    );
+  }
+}
+
+// ── Email-or-mobile input cap ──────────────────────────────────────────────────
+/// Stops the Email/Phone field at 10 characters, but ONLY while everything
+/// typed so far is digits.
+///
+/// A plain `LengthLimitingTextInputFormatter(10)` can't be used here: the same
+/// field accepts an email address, and almost every email is longer than ten
+/// characters. So the cap applies to a pure number and lifts the instant a
+/// non-digit appears — which also keeps a mobile-style address such as
+/// 9876543210@example.com typeable.
+class _MobileOrEmailLimiter extends TextInputFormatter {
+  static const _maxDigits = 10;
+
+  @override
+  TextEditingValue formatEditUpdate(
+      TextEditingValue oldValue, TextEditingValue newValue) {
+    final text = newValue.text;
+
+    // Not a pure number (or still short enough) — leave it alone.
+    if (text.length <= _maxDigits || !RegExp(r'^[0-9]+$').hasMatch(text)) {
+      return newValue;
+    }
+
+    // Keep the first 10 digits and hold the caret inside them, so typing or
+    // pasting an 11th digit simply does nothing instead of jumping the cursor.
+    final trimmed = text.substring(0, _maxDigits);
+    final offset = newValue.selection.baseOffset.clamp(0, _maxDigits).toInt();
+    return TextEditingValue(
+      text: trimmed,
+      selection: TextSelection.collapsed(offset: offset),
+      composing: TextRange.empty,
     );
   }
 }
