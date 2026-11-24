@@ -229,7 +229,37 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
   String get _empCode => (_data['employeeCode'] ?? '').toString();
   String get _status => (_data['status'] ?? '').toString();
 
+  /// Fixed-length fields that hold something of the wrong length.
+  ///
+  /// The input formatters above only run while someone is TYPING, so a record
+  /// saved before these rules existed can still arrive holding an 11-digit
+  /// mobile or a part-filled UAN. Checking here is what stops it going back to
+  /// the backend unchanged. Each field is only judged when it has a value, so
+  /// leaving an optional one blank is still fine.
+  String? get _lengthProblem {
+    String? check(String label, String value, int len) {
+      final v = value.trim();
+      return (v.isNotEmpty && v.length != len)
+          ? '$label must be exactly $len digits.'
+          : null;
+    }
+
+    return check('Mobile number', _phoneCtrl.text, 10) ??
+        check('UAN', _uanCtrl.text, 12) ??
+        check('ESIC number', _esicCtrl.text, 10);
+  }
+
   Future<void> _save() async {
+    final problem = _lengthProblem;
+    if (problem != null) {
+      Get.snackbar('Invalid', problem,
+          backgroundColor: AppColors.warning,
+          colorText: Colors.white,
+          snackPosition: SnackPosition.BOTTOM,
+          margin: const EdgeInsets.all(16));
+      return;
+    }
+
     setState(() => _saving = true);
     try {
       await _api.patchEmployee(widget.employeeId, {
@@ -696,7 +726,13 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
               _maritalStatus,
               ['SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED'],
               (v) => setState(() => _maritalStatus = v)),
-          _fieldRow('Phone', _phoneCtrl, keyboard: TextInputType.phone),
+          // Mobile: digits only, hard stop at 10 — same rule as Add Employee.
+          _fieldRow('Phone', _phoneCtrl,
+              keyboard: TextInputType.phone,
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(10),
+              ]),
           _fieldRow('Email', _emailCtrl, keyboard: TextInputType.emailAddress),
           _fieldRow("Father/Husband Name", _fatherNameCtrl),
           _fieldRow("Mother's Name", _motherNameCtrl),
@@ -719,9 +755,20 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
       case 2:
         return [
           _fieldRow('PAN', _panCtrl),
-          _fieldRow('UAN', _uanCtrl),
+          // UAN = 12 digits, ESIC = 10 digits — matching Add Employee.
+          _fieldRow('UAN', _uanCtrl,
+              keyboard: TextInputType.number,
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(12),
+              ]),
           _fieldRow('PF Account', _pfCtrl),
-          _fieldRow('ESIC', _esicCtrl),
+          _fieldRow('ESIC', _esicCtrl,
+              keyboard: TextInputType.number,
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(10),
+              ]),
           if (_bank.isNotEmpty) ...[
             const SizedBox(height: 8),
             Padding(
@@ -794,7 +841,10 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
   }
 
   Widget _fieldRow(String label, TextEditingController ctrl,
-      {bool required = false, TextInputType? keyboard, int maxLines = 1}) {
+      {bool required = false,
+      TextInputType? keyboard,
+      int maxLines = 1,
+      List<TextInputFormatter>? inputFormatters}) {
     if (!_editing) return _infoRow(label, ctrl.text);
     return Padding(
       padding: const EdgeInsets.only(bottom: 14),
@@ -812,6 +862,7 @@ class _EmployeeEditPageState extends State<EmployeeEditPage> {
             controller: ctrl,
             keyboardType: keyboard,
             maxLines: maxLines,
+            inputFormatters: inputFormatters,
             style: AppTextStyles.bodyMedium.copyWith(color: t.textPrimary),
             decoration: InputDecoration(
               filled: true,

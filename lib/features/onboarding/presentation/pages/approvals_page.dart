@@ -5,6 +5,7 @@ import '../../../../core/theme/app_theme.dart';
 import '../../../../core/network/api_client.dart';
 import '../../../../shared/widgets/shared_widgets.dart';
 import '../../data/employee_api.dart';
+import 'employee_edit_page.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MODEL
@@ -277,9 +278,24 @@ class ApprovalsController extends GetxController {
   }
 
   /// Approve an onboarding hire — POST /api/v1/employees/{id}/approve
+  ///
+  /// On success the approved employee is opened in the edit page so the record
+  /// can be reviewed straight away. The id comes from the RESPONSE BODY
+  /// (data.employeeId), not from the id we posted to — the response is the
+  /// authoritative record, and reading it there means a backend that returns a
+  /// different id (a merged or re-issued record) still lands on the right
+  /// employee. The posted id is only a fallback for a response without one.
   Future<void> approve(int id) async {
     try {
-      await _dio.post('/api/v1/employees/$id/approve', data: {});
+      final res = await _dio.post('/api/v1/employees/$id/approve', data: {});
+
+      final data = res.data?['data'];
+      final raw = data is Map ? data['employeeId'] : null;
+      final approvedId =
+          raw is int ? raw : (int.tryParse(raw?.toString() ?? '') ?? id);
+      final approvedName =
+          (data is Map ? data['fullName']?.toString() : null) ?? '';
+
       // Update local state
       final idx =
           _items.indexWhere((i) => i.id == id && i.type == 'Onboarding');
@@ -297,11 +313,21 @@ class ApprovalsController extends GetxController {
           client: old.client,
         );
       }
-      Get.snackbar('Approved', 'Onboarding approved successfully.',
+      Get.snackbar(
+          'Approved',
+          approvedName.isEmpty
+              ? 'Onboarding approved. Opening the record for review…'
+              : '$approvedName approved. Opening the record for review…',
           backgroundColor: AppColors.success,
           colorText: Colors.white,
           snackPosition: SnackPosition.BOTTOM,
           margin: const EdgeInsets.all(16));
+
+      // Straight into the record so it can be checked and completed — a newly
+      // approved hire lands on PENDING_SALARY_SETUP and usually still needs
+      // details filling in. Pushed, not replaced, so Back returns to the queue.
+      Get.to(() => EmployeeEditPage(employeeId: approvedId),
+          transition: Transition.cupertino);
     } on DioException catch (e) {
       Get.snackbar('Error', ApiFailure.fromDioException(e).message,
           backgroundColor: AppColors.danger,
