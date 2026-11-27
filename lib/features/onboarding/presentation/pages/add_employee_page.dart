@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -6,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:get/get.dart' hide FormData, MultipartFile;
 import 'package:image_picker/image_picker.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/constants/employment_requirements.dart';
 import '../../../../core/network/api_client.dart';
@@ -179,6 +181,43 @@ class AddEmployeeController extends GetxController {
   final pfController = TextEditingController();
   final esicController = TextEditingController();
 
+  // ── Local draft persistence ───────────────────────────────────────────────
+  // Typed fields + simple dropdown selections are saved to secure storage
+  // (debounced) as the user edits, and reloaded when the page is reopened, so
+  // the form survives an interruption (a call, backgrounding, navigating away
+  // and back) and only goes blank on a manual Reset or a successful create.
+  // NOTE: photo/documents and the cascading Job Details dropdowns are not
+  // persisted — only the fields the user types plus the standalone dropdowns.
+  static const _storage = FlutterSecureStorage();
+  static const _draftKey = 'add_employee_draft_v1';
+  bool _draftLoaded = false;
+  Timer? _draftDebounce;
+
+  /// The text fields that are saved/restored, keyed by a stable draft key.
+  Map<String, TextEditingController> get _draftFields => {
+        'aadhaar': aadhaarController,
+        'fullName': fullNameController,
+        'fatherHusbandName': fatherHusbandNameController,
+        'motherName': motherNameController,
+        'email': emailController,
+        'phone': phoneController,
+        'secondaryPhone': secondaryPhoneController,
+        'dob': dobController,
+        'bloodGroup': bloodGroupController,
+        'caste': casteController,
+        'permanentAddress': permanentAddressController,
+        'currentAddress': currentAddressController,
+        'joiningDate': joiningDateController,
+        'confirmationDate': confirmationDateController,
+        'bankAccount': bankAccountController,
+        'ifsc': ifscController,
+        'bankBranch': bankBranchController,
+        'pan': panController,
+        'uan': uanController,
+        'pf': pfController,
+        'esic': esicController,
+      };
+
   // Confirmation date disabled for now — uncomment to restore.
   // bool _confirmationTouched = false;
 
@@ -295,6 +334,154 @@ class AddEmployeeController extends GetxController {
     emailController.addListener(_onEmailChanged);
     phoneController.addListener(_onPhoneChanged);
     ifscController.addListener(_onIfscChanged);
+
+    // Restore any saved draft, then start auto-saving on change.
+    _restoreDraft();
+  }
+
+  // ── Draft save / restore ──────────────────────────────────────────────────
+  /// Loads a saved draft (if any) into the form, then wires up auto-save.
+  Future<void> _restoreDraft() async {
+    try {
+      final raw = await _storage.read(key: _draftKey);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map<String, dynamic>) _applyDraft(decoded);
+      }
+    } catch (_) {
+      // Corrupt/unreadable draft — ignore and start clean.
+    }
+    _draftLoaded = true;
+    _wireDraftAutosave();
+    recomputeMissing();
+  }
+
+  /// Populates the form from a decoded draft map. Only non-cascading fields are
+  /// restored, so the Job Details reactive wiring is never fought.
+  void _applyDraft(Map<String, dynamic> m) {
+    _draftFields.forEach((key, controller) {
+      final v = m[key];
+      if (v is String) controller.text = v;
+    });
+    final employment = m['employmentType'];
+    if (employment is String && employment.isNotEmpty) {
+      employmentType.value = employment;
+    }
+    final consent = m['aadhaarConsentGiven'];
+    if (consent is bool) aadhaarConsentGiven.value = consent;
+    final gender = m['gender'];
+    if (gender is String) genderValue.value = gender;
+    final marital = m['maritalStatus'];
+    if (marital is String) maritalStatusValue.value = marital;
+    final bg = m['bloodGroupValue'];
+    if (bg is String) bloodGroupValue.value = bg;
+    final caste = m['casteValue'];
+    if (caste is String) casteValue.value = caste;
+    final bank = m['bankName'];
+    if (bank is String) bankNameValue.value = bank;
+    final fam = m['familyMembers'];
+    if (fam is List) {
+      familyMembers.assignAll(
+          fam.map((e) => Map<String, dynamic>.from(e as Map)).toList());
+    }
+    final emg = m['emergencyContacts'];
+    if (emg is List) {
+      emergencyContacts.assignAll(
+          emg.map((e) => Map<String, dynamic>.from(e as Map)).toList());
+    }
+  }
+
+  /// Attaches listeners that debounce-save the draft whenever a saved field
+  /// changes. Called once, after the initial restore, so loading never
+  /// triggers a save.
+  void _wireDraftAutosave() {
+    for (final c in _draftFields.values) {
+      c.addListener(_scheduleDraftSave);
+    }
+    ever(employmentType, (_) => _scheduleDraftSave());
+    ever(aadhaarConsentGiven, (_) => _scheduleDraftSave());
+    ever(genderValue, (_) => _scheduleDraftSave());
+    ever(maritalStatusValue, (_) => _scheduleDraftSave());
+    ever(bloodGroupValue, (_) => _scheduleDraftSave());
+    ever(casteValue, (_) => _scheduleDraftSave());
+    ever(bankNameValue, (_) => _scheduleDraftSave());
+    ever(familyMembers, (_) => _scheduleDraftSave());
+    ever(emergencyContacts, (_) => _scheduleDraftSave());
+  }
+
+  void _scheduleDraftSave() {
+    if (!_draftLoaded) return;
+    _draftDebounce?.cancel();
+    _draftDebounce = Timer(const Duration(milliseconds: 350), _saveDraftNow);
+  }
+
+  Future<void> _saveDraftNow() async {
+    if (!_draftLoaded) return;
+    try {
+      final m = <String, dynamic>{};
+      _draftFields.forEach((key, c) => m[key] = c.text);
+      m['employmentType'] = employmentType.value;
+      m['aadhaarConsentGiven'] = aadhaarConsentGiven.value;
+      m['gender'] = genderValue.value;
+      m['maritalStatus'] = maritalStatusValue.value;
+      m['bloodGroupValue'] = bloodGroupValue.value;
+      m['casteValue'] = casteValue.value;
+      m['bankName'] = bankNameValue.value;
+      m['familyMembers'] = familyMembers.toList();
+      m['emergencyContacts'] = emergencyContacts.toList();
+      await _storage.write(key: _draftKey, value: jsonEncode(m));
+    } catch (_) {
+      // Best-effort — never block the UI on a failed write.
+    }
+  }
+
+  /// Clears the whole form (fields, dropdowns, staged lists, photo/docs) and
+  /// deletes the saved draft. Wired to the Reset button.
+  Future<void> resetForm() async {
+    _draftDebounce?.cancel();
+    for (final c in _draftFields.values) {
+      c.clear();
+    }
+    clientController.clear();
+    branchController.clear();
+    departmentController.clear();
+    designationController.clear();
+
+    employmentType.value = 'CONTRACT';
+    aadhaarConsentGiven.value = false;
+    genderValue.value = '';
+    maritalStatusValue.value = '';
+    bloodGroupValue.value = '';
+    casteValue.value = '';
+    bankNameValue.value = '';
+    sameAsPermAddress.value = false;
+
+    selectedClientId.value = null;
+    selectedBranchId.value = null;
+    selectedDepartmentId.value = null;
+    selectedDesignationId.value = null;
+
+    familyMembers.clear();
+    emergencyContacts.clear();
+
+    profilePicture.value = null;
+    profilePictureBytes.value = null;
+    profilePictureName.value = '';
+    documents.clear();
+    documentBytes.clear();
+    documentNames.clear();
+
+    aadhaarCheckState.value = 'IDLE';
+    aadhaarExisting.value = null;
+    emailCheckState.value = 'IDLE';
+    phoneCheckState.value = 'IDLE';
+    ifscCheckState.value = 'IDLE';
+    ifscDetails.value = null;
+
+    try {
+      await _storage.delete(key: _draftKey);
+    } catch (_) {}
+    recomputeMissing();
   }
 
   // ── Input rules (controller-level) ────────────────────────────────────────
@@ -531,6 +718,7 @@ class AddEmployeeController extends GetxController {
     _emailDebounce?.cancel();
     _phoneDebounce?.cancel();
     _ifscDebounce?.cancel();
+    _draftDebounce?.cancel();
     for (final c in [
       bankBranchController,
       aadhaarController,
@@ -1040,6 +1228,15 @@ class AddEmployeeController extends GetxController {
 
     submitting.value = false;
 
+    // Employee created — the saved draft is no longer needed, so clear it so a
+    // fresh Add Employee form starts blank next time.
+    if (createdEmployeeId.value != null) {
+      _draftDebounce?.cancel();
+      try {
+        await _storage.delete(key: _draftKey);
+      } catch (_) {}
+    }
+
     // The employee record exists now — refresh the Dashboard and Employees
     // tabs, and switch to Employees behind the result sheet, so tapping
     // Done lands on the updated list.
@@ -1164,7 +1361,50 @@ class AddEmployeePage extends StatelessWidget {
             ),
           );
         }),
+        // Manually clear the whole form (and the saved draft).
+        Padding(
+          padding: const EdgeInsets.only(right: 8),
+          child: TextButton.icon(
+            onPressed: () => _confirmReset(context, ctrl),
+            icon: const Icon(Icons.restart_alt_rounded,
+                size: 18, color: AppColors.danger),
+            label: Text('Reset',
+                style: AppTextStyles.caption.copyWith(
+                    color: AppColors.danger, fontWeight: FontWeight.w600)),
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              minimumSize: const Size(0, 36),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        ),
       ],
+    );
+  }
+
+  /// Asks for confirmation before wiping the form, then resets it.
+  void _confirmReset(BuildContext context, AddEmployeeController ctrl) {
+    Get.dialog(
+      AlertDialog(
+        title: const Text('Reset form?'),
+        content: const Text(
+            'This clears everything you have entered, including the saved '
+            'draft. This cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Get.back(),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () {
+              Get.back();
+              ctrl.resetForm();
+            },
+            child:
+                const Text('Reset', style: TextStyle(color: AppColors.danger)),
+          ),
+        ],
+      ),
     );
   }
 
