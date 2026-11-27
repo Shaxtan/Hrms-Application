@@ -19,8 +19,8 @@ class ApiClient {
   static const String _apiHost = 'http://103.139.58.189';
   static const String _apiMode = 'port';
 
-  static const _modulePorts = {'platform': 8080, 'core': 8081, 'payroll': 8082};
-  // static const _modulePorts = {'platform': 8090, 'core': 8091, 'payroll': 8092};
+  // static const _modulePorts = {'platform': 8080, 'core': 8081, 'payroll': 8082};
+  static const _modulePorts = {'platform': 8090, 'core': 8091, 'payroll': 8092};
 
   static const _oldToNew = {
     'AUTH': 'platform',
@@ -153,6 +153,51 @@ class ApiClient {
   /// below is sticky by design, so it must be cleared when a new session
   /// starts or the very first 401 of that session would be swallowed.
   static void resetSessionExpiry() => _AuthInterceptor.resetSessionExpiry();
+
+  // ── Session keep-alive support ────────────────────────────────────────────
+  // The 401 interceptor below refreshes REACTIVELY: it only runs once a
+  // request has already failed. That is too late for someone part-way through
+  // a long form — the request that 401s is their save. These let
+  // SessionManager refresh BEFORE the token dies, so an active user never
+  // meets a 401 at all.
+
+  /// When the access token expires, read from its own `exp` claim.
+  /// Null when there is no token or the claim is missing/unparseable.
+  static DateTime? accessTokenExpiry([String? token]) {
+    if (token == null || token.isEmpty) return null;
+    final exp = decodeJwtPayload(token)['exp'];
+    final secs = exp is int ? exp : int.tryParse(exp?.toString() ?? '');
+    if (secs == null) return null;
+    return DateTime.fromMillisecondsSinceEpoch(secs * 1000, isUtc: true)
+        .toLocal();
+  }
+
+  /// Whether a refresh is even possible on this platform.
+  ///
+  /// On web the browser replays the HttpOnly cookie, so refresh is always
+  /// available. On mobile Dio has no cookie store, so refresh works only if
+  /// the cookie was captured from a Set-Cookie header at login — and if the
+  /// backend never sends one to this client, NOTHING keeps the session alive
+  /// past the token's 15 minutes. Surfacing it makes that diagnosable instead
+  /// of looking like a random logout.
+  static Future<bool> hasRefreshCredential() async {
+    if (kIsWeb) return true;
+    final stored = await _storage.read(key: 'refresh_token');
+    return stored != null && stored.isNotEmpty;
+  }
+
+  /// Mint a fresh access token and persist it. Returns null if refresh is not
+  /// possible or the server refused. Never redirects — the caller decides.
+  static Future<String?> refreshAccessToken() async {
+    try {
+      final token = await _AuthInterceptor.performRefresh();
+      if (token == null || token.isEmpty) return null;
+      await _storage.write(key: 'auth_token', value: token);
+      return token;
+    } catch (_) {
+      return null;
+    }
+  }
 
   static Dio get instance => _dio;
 
@@ -360,7 +405,11 @@ class _AuthInterceptor extends Interceptor {
   /// POST /api/v1/auth/refresh carrying whatever credential this platform has.
   /// Returns null when there is nothing to send, so the caller fails fast
   /// instead of burning a round-trip that can never succeed.
-  Future<String?> _performRefresh() async {
+  Future<String?> _performRefresh() => performRefresh();
+
+  /// Static so SessionManager can refresh proactively without going through a
+  /// failed request first. Same call the 401 path makes.
+  static Future<String?> performRefresh() async {
     final stored = await _storage.read(key: 'refresh_token');
 
     // On web the browser replays the HttpOnly cookie itself (withCredentials),

@@ -6,6 +6,7 @@ import 'package:dio/dio.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/network/api_client.dart';
 import '../../../../core/security/biometric_service.dart';
+import '../../../../core/security/session_manager.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AUTH CONTROLLER — real API: POST /api/v1/auth/login
@@ -156,6 +157,9 @@ class AuthController extends GetxController with WidgetsBindingObserver {
     userInitials.value = await _storage.read(key: 'user_initials') ?? '';
     userEmail.value = await _storage.read(key: 'user_email') ?? '';
     isLoggedIn.value = true;
+    // Watch for idleness from the moment a session exists again. `restored`
+    // makes it honour the idle clock from BEFORE the app was closed.
+    _startSessionWatch(restored: true);
 
     // If name is empty, try decoding from JWT
     if (userName.value.isEmpty) {
@@ -327,6 +331,7 @@ class AuthController extends GetxController with WidgetsBindingObserver {
       mustChangePwd.value = forceChange;
       isLoggedIn.value = true;
       isLoading.value = false;
+      _startSessionWatch();
 
       if (forceChange) {
         // Carry the temporary password forward so the change screen can
@@ -445,7 +450,18 @@ class AuthController extends GetxController with WidgetsBindingObserver {
     }
   }
 
+  /// Idle-timeout watch. Kept in one place so login and session-restore
+  /// can't drift apart.
+  void _startSessionWatch({bool restored = false}) {
+    if (Get.isRegistered<SessionManager>()) {
+      SessionManager.to.start(restored: restored);
+    }
+  }
+
   Future<void> logout() async {
+    // Stop first: the watcher must not fire again while we tear the session
+    // down, or an idle logout could re-enter this method.
+    if (Get.isRegistered<SessionManager>()) SessionManager.to.stop();
     try {
       await ApiClient.instance.post('/api/v1/auth/logout');
     } catch (_) {}
